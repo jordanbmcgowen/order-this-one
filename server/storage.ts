@@ -1,4 +1,4 @@
-import { type User, type InsertUser, users } from "@shared/schema";
+import { type Recommendation, type InsertRecommendation, recommendations } from "@shared/schema";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
 import { eq } from "drizzle-orm";
@@ -9,22 +9,34 @@ sqlite.pragma("journal_mode = WAL");
 export const db = drizzle(sqlite);
 
 export interface IStorage {
-  getUser(id: number): Promise<User | undefined>;
-  getUserByUsername(username: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+  getRecommendation(placeId: string): Promise<Recommendation | undefined>;
+  createRecommendation(rec: InsertRecommendation): Promise<Recommendation>;
 }
 
 export class DatabaseStorage implements IStorage {
-  async getUser(id: number): Promise<User | undefined> {
-    return db.select().from(users).where(eq(users.id, id)).get();
+  constructor() {
+    // Create table if not exists
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS recommendations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        place_id TEXT NOT NULL,
+        restaurant_name TEXT NOT NULL,
+        dish_name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        why_this_one TEXT NOT NULL,
+        price_range TEXT,
+        tags TEXT,
+        created_at TEXT NOT NULL
+      )
+    `);
   }
 
-  async getUserByUsername(username: string): Promise<User | undefined> {
-    return db.select().from(users).where(eq(users.username, username)).get();
+  async getRecommendation(placeId: string): Promise<Recommendation | undefined> {
+    return db.select().from(recommendations).where(eq(recommendations.placeId, placeId)).get();
   }
 
-  async createUser(insertUser: InsertUser): Promise<User> {
-    return db.insert(users).values(insertUser).returning().get();
+  async createRecommendation(rec: InsertRecommendation): Promise<Recommendation> {
+    return db.insert(recommendations).values(rec).returning().get();
   }
 }
 
