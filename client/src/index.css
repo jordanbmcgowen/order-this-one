@@ -221,3 +221,12 @@
     inset: -1px;
   }
 }
+
+/* Hide scrollbar for thumbnail strips */
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}

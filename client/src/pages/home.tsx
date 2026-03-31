@@ -10,6 +10,7 @@ import {
   MapPin,
   Star,
   ChevronRight,
+  ChevronLeft,
   ArrowLeft,
   Utensils,
   Flame,
@@ -17,10 +18,102 @@ import {
   Navigation,
   Search,
   Sparkles,
+  Camera,
 } from "lucide-react";
 import type { RestaurantResult, DishRecommendation } from "@shared/schema";
 
 type AppState = "locating" | "browse" | "loading-rec" | "result";
+
+function PhotoGallery({ photoRefs, dishName }: { photoRefs: string[]; dishName: string }) {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [failedImages, setFailedImages] = useState<Set<number>>(new Set());
+
+  const validRefs = photoRefs.filter((_, i) => !failedImages.has(i));
+  const validIndices = photoRefs.map((_, i) => i).filter(i => !failedImages.has(i));
+
+  if (validRefs.length === 0) return null;
+
+  // Determine the photo URL - v1 photo names contain "places/" prefix
+  const getPhotoUrl = (ref: string) => {
+    if (ref.startsWith("places/")) {
+      return `/api/restaurants/photo?name=${encodeURIComponent(ref)}`;
+    }
+    return `/api/restaurants/photo?ref=${encodeURIComponent(ref)}`;
+  };
+
+  const currentValidPosition = validIndices.indexOf(activeIndex);
+  const safePosition = currentValidPosition >= 0 ? currentValidPosition : 0;
+  const safeActiveIndex = validIndices[safePosition] ?? validIndices[0];
+
+  return (
+    <div className="mt-4" data-testid="photo-gallery">
+      {/* Main image */}
+      <div className="relative rounded-xl overflow-hidden bg-muted aspect-[4/3]">
+        <img
+          src={getPhotoUrl(photoRefs[safeActiveIndex])}
+          alt={`${dishName} at restaurant`}
+          className="w-full h-full object-cover"
+          onError={() => setFailedImages(prev => new Set(prev).add(safeActiveIndex))}
+        />
+        {/* Navigation arrows */}
+        {validRefs.length > 1 && (
+          <>
+            <button
+              onClick={() => {
+                const prev = safePosition > 0 ? validIndices[safePosition - 1] : validIndices[validIndices.length - 1];
+                setActiveIndex(prev);
+              }}
+              className="absolute left-2 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full bg-black/40 hover:bg-black/60 flex items-center justify-center text-white transition-colors"
+              data-testid="photo-prev"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <button
+              onClick={() => {
+                const next = safePosition < validIndices.length - 1 ? validIndices[safePosition + 1] : validIndices[0];
+                setActiveIndex(next);
+              }}
+              className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full bg-black/40 hover:bg-black/60 flex items-center justify-center text-white transition-colors"
+              data-testid="photo-next"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </>
+        )}
+        {/* Photo counter */}
+        <div className="absolute bottom-2 right-2 bg-black/50 text-white text-xs px-2 py-1 rounded-full flex items-center gap-1">
+          <Camera className="w-3 h-3" />
+          {safePosition + 1}/{validRefs.length}
+        </div>
+      </div>
+      {/* Thumbnail strip */}
+      {validRefs.length > 1 && (
+        <div className="flex gap-1.5 mt-2 overflow-x-auto pb-1 scrollbar-hide">
+          {validIndices.map((origIndex, i) => (
+            <button
+              key={origIndex}
+              onClick={() => setActiveIndex(origIndex)}
+              className={`shrink-0 w-14 h-14 rounded-lg overflow-hidden border-2 transition-all ${
+                origIndex === safeActiveIndex
+                  ? "border-primary ring-1 ring-primary/30"
+                  : "border-transparent opacity-60 hover:opacity-100"
+              }`}
+              data-testid={`photo-thumb-${i}`}
+            >
+              <img
+                src={getPhotoUrl(photoRefs[origIndex])}
+                alt={`Photo ${i + 1}`}
+                className="w-full h-full object-cover"
+                loading="lazy"
+                onError={() => setFailedImages(prev => new Set(prev).add(origIndex))}
+              />
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Home() {
   const [appState, setAppState] = useState<AppState>("locating");
@@ -216,6 +309,11 @@ export default function Home() {
             <h1 className="text-2xl font-bold text-foreground leading-tight">
               {recommendation.dishName}
             </h1>
+
+            {/* Photo gallery */}
+            {recommendation.photoRefs && recommendation.photoRefs.length > 0 && (
+              <PhotoGallery photoRefs={recommendation.photoRefs} dishName={recommendation.dishName} />
+            )}
 
             <p className="text-base text-foreground/80 mt-4 leading-relaxed">
               {recommendation.description}

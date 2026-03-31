@@ -36,4 +36,5 @@ export interface DishRecommendation {
   priceRange: string;
   tags: string[];
   sources: string[];
+  photoRefs: string[];
 }
