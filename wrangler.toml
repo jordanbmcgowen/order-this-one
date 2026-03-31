@@ -4,4 +4,4 @@ pages_build_output_dir = "dist"
 
 [[kv_namespaces]]
 binding = "RECOMMENDATIONS"
-id = "placeholder"
+id = "9b0bea326ac44c06abb16f44b70edb48"
