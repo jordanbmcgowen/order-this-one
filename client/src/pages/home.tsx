@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
 import {
   MapPin,
   Star,
@@ -14,8 +15,7 @@ import {
   Flame,
   Loader2,
   Navigation,
-  Clock,
-  DollarSign,
+  Search,
   Sparkles,
 } from "lucide-react";
 import type { RestaurantResult, DishRecommendation } from "@shared/schema";
@@ -28,11 +28,14 @@ export default function Home() {
   const [selectedRestaurant, setSelectedRestaurant] = useState<RestaurantResult | null>(null);
   const [recommendation, setRecommendation] = useState<DishRecommendation | null>(null);
   const [locationError, setLocationError] = useState<string | null>(null);
+  const [manualLocation, setManualLocation] = useState("");
+  const [isGeocoding, setIsGeocoding] = useState(false);
+  const [locationLabel, setLocationLabel] = useState<string | null>(null);
 
   // Get user location
   useEffect(() => {
     if (!navigator.geolocation) {
-      setLocationError("Geolocation is not supported by your browser.");
+      setLocationError("manual");
       return;
     }
 
@@ -42,18 +45,32 @@ export default function Home() {
           lat: position.coords.latitude,
           lng: position.coords.longitude,
         });
+        setLocationLabel("Near you");
         setAppState("browse");
       },
-      (error) => {
-        setLocationError(
-          error.code === 1
-            ? "Location access denied. Please enable location permissions to find nearby restaurants."
-            : "Unable to determine your location. Please try again."
-        );
+      () => {
+        setLocationError("manual");
       },
-      { enableHighAccuracy: true, timeout: 10000 }
+      { enableHighAccuracy: true, timeout: 5000 }
     );
   }, []);
+
+  const handleManualSearch = useCallback(async () => {
+    if (!manualLocation.trim()) return;
+    setIsGeocoding(true);
+    try {
+      const res = await apiRequest("GET", `/api/geocode?address=${encodeURIComponent(manualLocation.trim())}`);
+      const data = await res.json();
+      setCoords({ lat: data.lat, lng: data.lng });
+      setLocationLabel(data.formatted);
+      setLocationError(null);
+      setAppState("browse");
+    } catch {
+      setLocationError("not_found");
+    } finally {
+      setIsGeocoding(false);
+    }
+  }, [manualLocation]);
 
   // Fetch nearby restaurants
   const {
@@ -127,21 +144,42 @@ export default function Home() {
     );
   }
 
-  // Location error
+  // Location error / manual entry
   if (locationError) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center px-6 bg-background">
-        <div className="flex flex-col items-center gap-6 text-center max-w-sm">
-          <div className="w-16 h-16 rounded-full bg-destructive/10 flex items-center justify-center">
-            <MapPin className="w-8 h-8 text-destructive" />
+        <div className="flex flex-col items-center gap-6 text-center max-w-sm w-full">
+          <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
+            <MapPin className="w-8 h-8 text-primary" />
           </div>
           <div>
-            <h1 className="text-xl font-bold text-foreground">Location Required</h1>
-            <p className="text-sm text-muted-foreground mt-2">{locationError}</p>
+            <h1 className="text-xl font-bold text-foreground">Where are you dining?</h1>
+            <p className="text-sm text-muted-foreground mt-2">
+              Enter an address, neighborhood, or zip code
+            </p>
           </div>
-          <Button onClick={() => window.location.reload()} data-testid="retry-location">
-            Try Again
-          </Button>
+          <form
+            className="w-full flex gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleManualSearch();
+            }}
+          >
+            <Input
+              value={manualLocation}
+              onChange={(e) => setManualLocation(e.target.value)}
+              placeholder="e.g. Deep Ellum, Dallas"
+              className="flex-1"
+              data-testid="location-input"
+              autoFocus
+            />
+            <Button type="submit" disabled={isGeocoding || !manualLocation.trim()} data-testid="search-location">
+              {isGeocoding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+            </Button>
+          </form>
+          {locationError === "not_found" && (
+            <p className="text-xs text-destructive">Could not find that location. Try a different search.</p>
+          )}
         </div>
       </div>
     );
@@ -276,6 +314,22 @@ export default function Home() {
           <p className="text-sm text-muted-foreground mt-1">
             Tap a restaurant to discover the one must-order dish.
           </p>
+          {locationLabel && (
+            <button
+              onClick={() => {
+                setCoords(null);
+                setLocationError("manual");
+                setLocationLabel(null);
+                setManualLocation("");
+              }}
+              className="flex items-center gap-1 mt-2 text-xs text-primary hover:underline"
+              data-testid="change-location"
+            >
+              <MapPin className="w-3 h-3" />
+              {locationLabel}
+              <span className="text-muted-foreground ml-1">Change</span>
+            </button>
+          )}
         </header>
 
         {/* Restaurant list */}

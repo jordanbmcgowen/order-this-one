@@ -205,5 +205,28 @@ Important: Be specific. Don't say "their pasta" - say "Cacio e Pepe" or "Rigaton
     }
   });
 
+  // Geocode an address or zip code to coordinates
+  app.get("/api/geocode", async (req, res) => {
+    try {
+      const address = req.query.address as string;
+      if (!address || !GOOGLE_API_KEY) {
+        return res.status(400).json({ error: "Missing address or API key" });
+      }
+
+      const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_API_KEY}`;
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (data.status !== "OK" || !data.results?.length) {
+        return res.status(400).json({ error: "Could not find that location" });
+      }
+
+      const loc = data.results[0].geometry.location;
+      res.json({ lat: loc.lat, lng: loc.lng, formatted: data.results[0].formatted_address });
+    } catch {
+      res.status(500).json({ error: "Geocoding failed" });
+    }
+  });
+
   return httpServer;
 }
