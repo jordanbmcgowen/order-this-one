@@ -11,7 +11,7 @@ interface DishRecommendation {
   priceRange: string;
   tags: string[];
   sources: string[];
-  photoRefs: string[];
+  dishPhotos: string[];
 }
 
 export const onRequestPost: PagesFunction<Env> = async (context) => {
@@ -36,13 +36,10 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // Gather data from multiple sources in parallel
+    // Gather review data from multiple sources in parallel
     const [placeDetailsV1, placeDetailsLegacy, webResults] = await Promise.all([
-      // 1. Places API (New) v1 for reviewSummary + reviews + photos
       fetchPlaceDetailsV1(placeId, apiKey),
-      // 2. Legacy Place Details for the 5 detailed reviews (different sort than v1)
       fetchPlaceDetailsLegacy(placeId, apiKey),
-      // 3. Web search for "best dish at [restaurant]" via Google Custom Search
       fetchWebInsights(restaurantName, apiKey),
     ]);
 
@@ -50,18 +47,15 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     const allReviewTexts: string[] = [];
     const sources: string[] = [];
 
-    // Add v1 review summary (AI-generated summary of ALL reviews, not just 5)
     if (placeDetailsV1.reviewSummary) {
       allReviewTexts.push(`[Google Review Summary - based on all ${placeDetailsV1.reviewCount || "many"} reviews] ${placeDetailsV1.reviewSummary}`);
       sources.push(`Google review summary (${placeDetailsV1.reviewCount || "many"} total reviews)`);
     }
 
-    // Add editorial summary
     if (placeDetailsV1.editorialSummary) {
       allReviewTexts.push(`[Editorial Summary] ${placeDetailsV1.editorialSummary}`);
     }
 
-    // Add v1 individual reviews
     if (placeDetailsV1.reviews.length > 0) {
       for (const r of placeDetailsV1.reviews) {
         allReviewTexts.push(`[Google Review - ${r.rating}★] ${r.text}`);
@@ -69,7 +63,6 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       sources.push(`${placeDetailsV1.reviews.length} Google reviews analyzed`);
     }
 
-    // Add legacy reviews (may overlap but often different sort order gives different reviews)
     if (placeDetailsLegacy.reviews.length > 0) {
       const existingTexts = new Set(allReviewTexts.map(t => t.slice(0, 100)));
       let addedCount = 0;
@@ -85,7 +78,6 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // Add web search results (Yelp, food blogs, etc.)
     if (webResults.length > 0) {
       for (const result of webResults) {
         allReviewTexts.push(`[Web - ${result.source}] ${result.snippet}`);
@@ -94,12 +86,6 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       sources.push(`Web research (${webSources.join(", ")})`);
     }
 
-    // Collect photo references from the place
-    const photoRefs: string[] = placeDetailsV1.photoRefs.length > 0
-      ? placeDetailsV1.photoRefs
-      : placeDetailsLegacy.photoRefs;
-
-    // Build the review context for Claude
     const reviewContext = allReviewTexts.length > 0
       ? `Here is research data for ${restaurantName}:\n\n${allReviewTexts.join("\n\n")}`
       : `No review data available. Use your extensive knowledge of ${restaurantName} to make a recommendation.`;
@@ -108,7 +94,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
       sources.push("AI recommendation based on restaurant knowledge");
     }
 
-    // Call Anthropic API
+    // Call Anthropic API to pick the dish
     const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -154,29 +140,39 @@ Important: Be specific. Don't say "their pasta" - say "Cacio e Pepe" or "Rigaton
     const anthropicData: any = await anthropicResponse.json();
     const responseText = anthropicData.content?.[0]?.text || "";
 
-    let recommendation: DishRecommendation;
+    let dishName: string;
+    let description: string;
+    let whyThisOne: string;
+    let priceRange: string;
+    let tags: string[];
+
     try {
       const parsed = JSON.parse(responseText);
-      recommendation = {
-        dishName: parsed.dishName || "Chef's Special",
-        description: parsed.description || "A delicious signature dish.",
-        whyThisOne: parsed.whyThisOne || "Highly recommended by locals and critics alike.",
-        priceRange: parsed.priceRange || "$$",
-        tags: parsed.tags || ["must-try"],
-        sources,
-        photoRefs: photoRefs.slice(0, 6),
-      };
+      dishName = parsed.dishName || "Chef's Special";
+      description = parsed.description || "A delicious signature dish.";
+      whyThisOne = parsed.whyThisOne || "Highly recommended by locals and critics alike.";
+      priceRange = parsed.priceRange || "$$";
+      tags = parsed.tags || ["must-try"];
     } catch {
-      recommendation = {
-        dishName: "Chef's Signature Dish",
-        description: "The standout item on the menu, crafted with care and consistently praised.",
-        whyThisOne: "When in doubt, trust the chef's pride and joy.",
-        priceRange: "$$",
-        tags: ["must-try", "signature"],
-        sources: ["AI recommendation"],
-        photoRefs: photoRefs.slice(0, 6),
-      };
+      dishName = "Chef's Signature Dish";
+      description = "The standout item on the menu, crafted with care and consistently praised.";
+      whyThisOne = "When in doubt, trust the chef's pride and joy.";
+      priceRange = "$$";
+      tags = ["must-try", "signature"];
     }
+
+    // Now search for actual photos of this specific dish
+    const dishPhotos = await searchDishPhotos(dishName, restaurantName, apiKey);
+
+    const recommendation: DishRecommendation = {
+      dishName,
+      description,
+      whyThisOne,
+      priceRange,
+      tags,
+      sources,
+      dishPhotos,
+    };
 
     // Cache in KV (TTL: 7 days)
     if (kv) {
@@ -190,7 +186,107 @@ Important: Be specific. Don't say "their pasta" - say "Cacio e Pepe" or "Rigaton
   }
 };
 
-// ---- Data fetching helpers ----
+// ---- Dish photo search ----
+
+async function searchDishPhotos(dishName: string, restaurantName: string, apiKey: string): Promise<string[]> {
+  const photos: string[] = [];
+
+  // Strategy 1: Google Custom Search JSON API (image search)
+  // Uses the same Google Cloud project as Maps API
+  // Search for "[dish] [restaurant]" to find photos from Yelp, food blogs, etc.
+  try {
+    const query = `${dishName} ${restaurantName} food`;
+    const searchUrl = `https://customsearch.googleapis.com/customsearch/v1?key=${apiKey}&cx=YOUR_CX_HERE&q=${encodeURIComponent(query)}&searchType=image&num=6&imgType=photo&safe=active`;
+
+    // Since Custom Search requires a separate CX (search engine ID),
+    // we'll use an alternative: scrape Google Images thumbnails
+    // via the standard search with tbm=isch parameter
+    const googleImgUrl = `https://www.google.com/search?q=${encodeURIComponent(`${dishName} ${restaurantName}`)}&tbm=isch&ijn=0`;
+
+    const resp = await fetch(googleImgUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html",
+      },
+    });
+
+    if (resp.ok) {
+      const html = await resp.text();
+      // Extract image URLs from Google Images HTML response
+      // Google embeds image data in script tags as base64 or URLs
+      const imgUrls = extractImageUrls(html);
+      photos.push(...imgUrls.slice(0, 6));
+    }
+  } catch (e) {
+    console.error("Google Images search error:", e);
+  }
+
+  // Strategy 2: Fallback to Places text search for food photos
+  if (photos.length < 3 && apiKey) {
+    try {
+      const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask": "places.photos",
+        },
+        body: JSON.stringify({
+          textQuery: `${dishName} at ${restaurantName}`,
+          maxResultCount: 3,
+        }),
+      });
+
+      const data: any = await resp.json();
+      if (data.places) {
+        for (const place of data.places) {
+          for (const photo of (place.photos || []).slice(0, 3)) {
+            if (photo.name) {
+              // Convert Places v1 photo name to our proxy URL
+              photos.push(`places-v1:${photo.name}`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Places text search photo error:", e);
+    }
+  }
+
+  return photos.slice(0, 6);
+}
+
+function extractImageUrls(html: string): string[] {
+  const urls: string[] = [];
+
+  // Method 1: Extract from data attributes and img tags
+  // Google Images embeds thumbnails as data:image or https URLs
+  const imgRegex = /\["(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)",\s*\d+,\s*\d+\]/gi;
+  let match;
+  while ((match = imgRegex.exec(html)) !== null) {
+    const url = match[1];
+    // Skip Google's own assets, icons, and tiny images
+    if (url && !url.includes("gstatic.com") && !url.includes("google.com/images") && !url.includes("googleusercontent.com/fakeurl")) {
+      // Unescape the URL
+      const cleanUrl = url.replace(/\\u003d/g, "=").replace(/\\u0026/g, "&").replace(/\\/g, "");
+      urls.push(cleanUrl);
+    }
+  }
+
+  // Method 2: Extract encrypted_tbn0 thumbnail URLs (these are Google-hosted thumbnails)
+  const tbnRegex = /https:\/\/encrypted-tbn0\.gstatic\.com\/images\?q=tbn:[^"'\s]+/g;
+  let tbnMatch;
+  while ((tbnMatch = tbnRegex.exec(html)) !== null) {
+    const url = tbnMatch[0].replace(/\\u003d/g, "=").replace(/\\u0026/g, "&").replace(/\\/g, "");
+    if (!urls.includes(url)) {
+      urls.push(url);
+    }
+  }
+
+  return urls;
+}
+
+// ---- Review data fetching helpers ----
 
 interface V1PlaceData {
   reviewSummary: string | null;
@@ -284,21 +380,8 @@ async function fetchWebInsights(restaurantName: string, apiKey: string): Promise
   if (!apiKey) return [];
 
   try {
-    // Use Google Text Search (Places) to find what people say about this restaurant's food
-    // This searches across Google's knowledge and returns relevant snippets
-    const queries = [
-      `best dish at ${restaurantName}`,
-      `${restaurantName} must try food`,
-      `${restaurantName} signature dish`,
-    ];
-
     const results: WebResult[] = [];
-
-    // Use Places Text Search to find mentions - this leverages Google's index
-    // We search for the restaurant + food terms to get contextual info
-    const textSearchUrl = `https://places.googleapis.com/v1/places:searchText`;
-
-    const resp = await fetch(textSearchUrl, {
+    const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

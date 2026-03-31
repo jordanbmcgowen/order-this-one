@@ -24,20 +24,26 @@ import type { RestaurantResult, DishRecommendation } from "@shared/schema";
 
 type AppState = "locating" | "browse" | "loading-rec" | "result";
 
-function PhotoGallery({ photoRefs, dishName }: { photoRefs: string[]; dishName: string }) {
+function PhotoGallery({ dishPhotos, dishName }: { dishPhotos: string[]; dishName: string }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const [failedImages, setFailedImages] = useState<Set<number>>(new Set());
 
-  const validRefs = photoRefs.filter((_, i) => !failedImages.has(i));
-  const validIndices = photoRefs.map((_, i) => i).filter(i => !failedImages.has(i));
+  const validPhotos = dishPhotos.filter((_, i) => !failedImages.has(i));
+  const validIndices = dishPhotos.map((_, i) => i).filter(i => !failedImages.has(i));
 
-  if (validRefs.length === 0) return null;
+  if (validPhotos.length === 0) return null;
 
-  // Determine the photo URL - v1 photo names contain "places/" prefix
+  // Determine the photo URL based on the source type
   const getPhotoUrl = (ref: string) => {
-    if (ref.startsWith("places/")) {
-      return `/api/restaurants/photo?name=${encodeURIComponent(ref)}`;
+    if (ref.startsWith("places-v1:")) {
+      // Places API v1 photo name, strip the prefix
+      return `/api/restaurants/photo?name=${encodeURIComponent(ref.slice(10))}`;
     }
+    if (ref.startsWith("https://")) {
+      // External URL (Google Images, etc.) - proxy through our endpoint
+      return `/api/restaurants/photo?url=${encodeURIComponent(ref)}`;
+    }
+    // Legacy Places API photo reference
     return `/api/restaurants/photo?ref=${encodeURIComponent(ref)}`;
   };
 
@@ -50,13 +56,13 @@ function PhotoGallery({ photoRefs, dishName }: { photoRefs: string[]; dishName: 
       {/* Main image */}
       <div className="relative rounded-xl overflow-hidden bg-muted aspect-[4/3]">
         <img
-          src={getPhotoUrl(photoRefs[safeActiveIndex])}
+          src={getPhotoUrl(dishPhotos[safeActiveIndex])}
           alt={`${dishName} at restaurant`}
           className="w-full h-full object-cover"
           onError={() => setFailedImages(prev => new Set(prev).add(safeActiveIndex))}
         />
         {/* Navigation arrows */}
-        {validRefs.length > 1 && (
+        {validPhotos.length > 1 && (
           <>
             <button
               onClick={() => {
@@ -83,11 +89,11 @@ function PhotoGallery({ photoRefs, dishName }: { photoRefs: string[]; dishName: 
         {/* Photo counter */}
         <div className="absolute bottom-2 right-2 bg-black/50 text-white text-xs px-2 py-1 rounded-full flex items-center gap-1">
           <Camera className="w-3 h-3" />
-          {safePosition + 1}/{validRefs.length}
+          {safePosition + 1}/{validPhotos.length}
         </div>
       </div>
       {/* Thumbnail strip */}
-      {validRefs.length > 1 && (
+      {validPhotos.length > 1 && (
         <div className="flex gap-1.5 mt-2 overflow-x-auto pb-1 scrollbar-hide">
           {validIndices.map((origIndex, i) => (
             <button
@@ -101,7 +107,7 @@ function PhotoGallery({ photoRefs, dishName }: { photoRefs: string[]; dishName: 
               data-testid={`photo-thumb-${i}`}
             >
               <img
-                src={getPhotoUrl(photoRefs[origIndex])}
+                src={getPhotoUrl(dishPhotos[origIndex])}
                 alt={`Photo ${i + 1}`}
                 className="w-full h-full object-cover"
                 loading="lazy"
@@ -311,8 +317,8 @@ export default function Home() {
             </h1>
 
             {/* Photo gallery */}
-            {recommendation.photoRefs && recommendation.photoRefs.length > 0 && (
-              <PhotoGallery photoRefs={recommendation.photoRefs} dishName={recommendation.dishName} />
+            {recommendation.dishPhotos && recommendation.dishPhotos.length > 0 && (
+              <PhotoGallery dishPhotos={recommendation.dishPhotos} dishName={recommendation.dishName} />
             )}
 
             <p className="text-base text-foreground/80 mt-4 leading-relaxed">
