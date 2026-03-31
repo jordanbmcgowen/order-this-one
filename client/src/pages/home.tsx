@@ -362,7 +362,6 @@ export default function Home() {
                     alt={restaurant.name}
                     className="w-14 h-14 rounded-lg object-cover shrink-0"
                     loading="lazy"
-                    crossOrigin="anonymous"
                   />
                 ) : (
                   <div className="w-14 h-14 rounded-lg bg-muted flex items-center justify-center shrink-0">

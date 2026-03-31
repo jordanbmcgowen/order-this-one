@@ -1,0 +1,7 @@
+name = "order-this-one"
+compatibility_date = "2024-09-23"
+pages_build_output_dir = "dist"
+
+[[kv_namespaces]]
+binding = "RECOMMENDATIONS"
+id = "placeholder"
