@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
@@ -19,8 +19,15 @@ import {
   Search,
   Sparkles,
   Camera,
+  X,
 } from "lucide-react";
 import type { RestaurantResult, DishRecommendation } from "@shared/schema";
+
+interface AutocompletePrediction {
+  placeId: string;
+  name: string;
+  description: string;
+}
 
 type AppState = "locating" | "browse" | "loading-rec" | "result";
 
@@ -130,6 +137,74 @@ export default function Home() {
   const [manualLocation, setManualLocation] = useState("");
   const [isGeocoding, setIsGeocoding] = useState(false);
   const [locationLabel, setLocationLabel] = useState<string | null>(null);
+  const [restaurantSearch, setRestaurantSearch] = useState("");
+  const [predictions, setPredictions] = useState<AutocompletePrediction[]>([]);
+  const [showPredictions, setShowPredictions] = useState(false);
+  const [isSearchingRestaurant, setIsSearchingRestaurant] = useState(false);
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchContainerRef = useRef<HTMLDivElement>(null);
+
+  // Close predictions dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (searchContainerRef.current && !searchContainerRef.current.contains(e.target as Node)) {
+        setShowPredictions(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  // Debounced restaurant name search
+  useEffect(() => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+
+    if (!restaurantSearch.trim()) {
+      setPredictions([]);
+      setShowPredictions(false);
+      return;
+    }
+
+    searchDebounceRef.current = setTimeout(async () => {
+      try {
+        let url = `/api/restaurants/autocomplete?input=${encodeURIComponent(restaurantSearch.trim())}`;
+        if (coords) {
+          url += `&lat=${coords.lat}&lng=${coords.lng}`;
+        }
+        const res = await apiRequest("GET", url);
+        const data = await res.json();
+        setPredictions(data.predictions || []);
+        setShowPredictions(true);
+      } catch {
+        setPredictions([]);
+      }
+    }, 300);
+
+    return () => {
+      if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    };
+  }, [restaurantSearch, coords]);
+
+  const handleSelectPrediction = useCallback(
+    async (prediction: AutocompletePrediction) => {
+      setShowPredictions(false);
+      setRestaurantSearch("");
+      setIsSearchingRestaurant(true);
+      try {
+        const res = await apiRequest("GET", `/api/restaurants/details?placeId=${encodeURIComponent(prediction.placeId)}`);
+        const data = await res.json();
+        const restaurant: RestaurantResult = data.restaurant;
+        setSelectedRestaurant(restaurant);
+        setAppState("loading-rec");
+        recommendMutation.mutate(restaurant);
+      } catch {
+        // Failed to fetch details
+      } finally {
+        setIsSearchingRestaurant(false);
+      }
+    },
+    [recommendMutation]
+  );
 
   // Get user location
   useEffect(() => {
@@ -435,6 +510,61 @@ export default function Home() {
             </button>
           )}
         </header>
+
+        {/* Restaurant name search */}
+        <div ref={searchContainerRef} className="relative mb-4">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              value={restaurantSearch}
+              onChange={(e) => setRestaurantSearch(e.target.value)}
+              onFocus={() => {
+                if (predictions.length > 0) setShowPredictions(true);
+              }}
+              placeholder="Search by restaurant name..."
+              className="pl-9 pr-9"
+              data-testid="restaurant-search-input"
+            />
+            {restaurantSearch && (
+              <button
+                onClick={() => {
+                  setRestaurantSearch("");
+                  setPredictions([]);
+                  setShowPredictions(false);
+                }}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+          {showPredictions && predictions.length > 0 && (
+            <div className="absolute z-50 w-full mt-1 bg-popover border border-border rounded-xl shadow-lg overflow-hidden">
+              {predictions.map((prediction) => (
+                <button
+                  key={prediction.placeId}
+                  onClick={() => handleSelectPrediction(prediction)}
+                  className="w-full text-left px-4 py-3 hover:bg-accent/50 transition-colors flex items-start gap-3 border-b border-border last:border-b-0"
+                  data-testid={`prediction-${prediction.placeId}`}
+                >
+                  <MapPin className="w-4 h-4 text-muted-foreground mt-0.5 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-foreground truncate">{prediction.name}</p>
+                    <p className="text-xs text-muted-foreground truncate">{prediction.description}</p>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Loading state for restaurant search selection */}
+        {isSearchingRestaurant && (
+          <div className="flex items-center justify-center py-8 mb-4">
+            <Loader2 className="w-5 h-5 animate-spin text-primary mr-2" />
+            <span className="text-sm text-muted-foreground">Loading restaurant details...</span>
+          </div>
+        )}
 
         {/* Restaurant list */}
         {isLoadingRestaurants ? (
