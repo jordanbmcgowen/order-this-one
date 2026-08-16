@@ -5,38 +5,55 @@ interface Env {
 export const onRequestGet: PagesFunction<Env> = async (context) => {
   try {
     const url = new URL(context.request.url);
-    const input = url.searchParams.get("input") || "";
-    const lat = url.searchParams.get("lat");
-    const lng = url.searchParams.get("lng");
+    const input = (url.searchParams.get("input") || "").trim();
+    const lat = parseFloat(url.searchParams.get("lat") || "");
+    const lng = parseFloat(url.searchParams.get("lng") || "");
 
-    if (!input.trim()) {
+    if (!input) {
       return Response.json({ predictions: [] });
     }
 
     const apiKey = context.env.GOOGLE_MAPS_API_KEY;
     if (!apiKey) {
-      return Response.json({ error: "Google Maps API key not configured" }, { status: 400 });
+      return Response.json({ error: "Server not configured" }, { status: 503 });
     }
 
-    let autocompleteUrl = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&types=restaurant&key=${apiKey}`;
+    const body: Record<string, unknown> = {
+      input,
+      includedPrimaryTypes: ["restaurant"],
+    };
 
-    // Bias results toward user's location if available
-    if (lat && lng) {
-      autocompleteUrl += `&location=${lat},${lng}&radius=50000`;
+    // Bias results toward the user's location if available.
+    if (!isNaN(lat) && !isNaN(lng)) {
+      body.locationBias = {
+        circle: { center: { latitude: lat, longitude: lng }, radius: 50000 },
+      };
     }
 
-    const response = await fetch(autocompleteUrl);
-    const data: any = await response.json();
+    const resp = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": apiKey,
+      },
+      body: JSON.stringify(body),
+    });
 
-    if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
-      return Response.json({ error: `Autocomplete API: ${data.status}` }, { status: 400 });
+    if (!resp.ok) {
+      console.error("Autocomplete failed:", resp.status, await resp.text());
+      return Response.json({ error: "Search failed" }, { status: 502 });
     }
 
-    const predictions = (data.predictions || []).map((p: any) => ({
-      placeId: p.place_id,
-      name: p.structured_formatting?.main_text || p.description,
-      description: p.structured_formatting?.secondary_text || "",
-    }));
+    const data: any = await resp.json();
+    const predictions = (data.suggestions || [])
+      .map((s: any) => s.placePrediction)
+      .filter(Boolean)
+      .map((p: any) => ({
+        placeId: p.placeId,
+        name: p.structuredFormat?.mainText?.text || p.text?.text || "",
+        description: p.structuredFormat?.secondaryText?.text || "",
+      }))
+      .filter((p: any) => p.placeId && p.name);
 
     return Response.json({ predictions });
   } catch (err) {

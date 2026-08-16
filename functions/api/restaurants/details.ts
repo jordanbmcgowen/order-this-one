@@ -1,3 +1,5 @@
+import { mapPlace, PLACE_FIELDS } from "./nearby";
+
 interface Env {
   GOOGLE_MAPS_API_KEY: string;
 }
@@ -13,32 +15,29 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
 
     const apiKey = context.env.GOOGLE_MAPS_API_KEY;
     if (!apiKey) {
-      return Response.json({ error: "Google Maps API key not configured" }, { status: 400 });
+      return Response.json({ error: "Server not configured" }, { status: 503 });
     }
 
-    const detailsUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(placeId)}&fields=place_id,name,vicinity,formatted_address,rating,user_ratings_total,price_level,photos,geometry,opening_hours,types&key=${apiKey}`;
+    const resp = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+      headers: {
+        "X-Goog-Api-Key": apiKey,
+        "X-Goog-FieldMask": PLACE_FIELDS.join(","),
+      },
+    });
 
-    const response = await fetch(detailsUrl);
-    const data: any = await response.json();
-
-    if (data.status !== "OK" || !data.result) {
-      return Response.json({ error: `Place Details API: ${data.status}` }, { status: 400 });
+    if (resp.status === 404) {
+      return Response.json({ error: "Restaurant not found" }, { status: 404 });
+    }
+    if (!resp.ok) {
+      console.error("Place details failed:", resp.status, await resp.text());
+      return Response.json({ error: "Failed to get restaurant details" }, { status: 502 });
     }
 
-    const r = data.result;
-    const restaurant = {
-      placeId: r.place_id,
-      name: r.name,
-      vicinity: r.vicinity || r.formatted_address || "",
-      rating: r.rating || 0,
-      userRatingsTotal: r.user_ratings_total || 0,
-      priceLevel: r.price_level || 0,
-      photoRef: r.photos?.[0]?.photo_reference || null,
-      lat: r.geometry.location.lat,
-      lng: r.geometry.location.lng,
-      openNow: r.opening_hours?.open_now ?? null,
-      types: r.types || [],
-    };
+    const data: any = await resp.json();
+    const restaurant = mapPlace(data);
+    if (!restaurant.placeId || !restaurant.name) {
+      return Response.json({ error: "Restaurant not found" }, { status: 404 });
+    }
 
     return Response.json({ restaurant });
   } catch (err) {

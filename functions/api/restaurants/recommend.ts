@@ -1,426 +1,453 @@
+import Anthropic from "@anthropic-ai/sdk";
+import { z } from "zod";
+import { recommendationRequestSchema } from "../../../shared/schema";
+import type { DishRecommendation, FeedbackCounts } from "../../../shared/schema";
+
 interface Env {
   GOOGLE_MAPS_API_KEY: string;
   ANTHROPIC_API_KEY: string;
   RECOMMENDATIONS: KVNamespace;
 }
 
-interface DishRecommendation {
-  dishName: string;
-  description: string;
-  whyThisOne: string;
-  priceRange: string;
-  tags: string[];
-  sources: string[];
-  dishPhotos: string[];
-}
+const REC_VERSION = 2;
+const recKey = (placeId: string) => `rec:v${REC_VERSION}:${placeId}`;
+const feedbackKey = (placeId: string) => `fb:v1:${placeId}`;
+
+// Confidence-weighted cache lifetimes: strong evidence keeps longer, weak
+// evidence gets retried sooner so the database self-corrects.
+const TTL_BY_CONFIDENCE: Record<string, number> = {
+  high: 30 * 24 * 3600,
+  medium: 14 * 24 * 3600,
+  low: 3 * 24 * 3600,
+};
 
 export const onRequestPost: PagesFunction<Env> = async (context) => {
+  let body: unknown;
   try {
-    const body: any = await context.request.json();
-    const placeId = body.placeId;
-    const restaurantName = body.restaurantName;
+    body = await context.request.json();
+  } catch {
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
 
-    if (!placeId || !restaurantName) {
-      return Response.json({ error: "Invalid request" }, { status: 400 });
-    }
+  const parsed = recommendationRequestSchema.safeParse(body);
+  if (!parsed.success) {
+    return Response.json({ error: "Invalid request" }, { status: 400 });
+  }
+  const { placeId } = parsed.data;
 
-    const apiKey = context.env.GOOGLE_MAPS_API_KEY;
-    const anthropicKey = context.env.ANTHROPIC_API_KEY;
+  const { GOOGLE_MAPS_API_KEY: mapsKey, ANTHROPIC_API_KEY: anthropicKey, RECOMMENDATIONS: kv } = context.env;
+  if (!mapsKey || !anthropicKey) {
+    return Response.json({ error: "Server not configured" }, { status: 503 });
+  }
 
-    // Check KV cache first
-    const kv = context.env.RECOMMENDATIONS;
+  try {
+    const feedback = kv ? await readFeedback(kv, placeId) : null;
+
+    // Serve from cache unless user feedback says the cached pick is wrong.
     if (kv) {
-      const cached = await kv.get(placeId, "json");
-      if (cached) {
+      const cached = await kv.get<DishRecommendation>(recKey(placeId), "json");
+      if (cached && !isDiscredited(cached.dishName, feedback)) {
         return Response.json({ recommendation: cached, cached: true });
       }
     }
 
-    // Gather review data from multiple sources in parallel
-    const [placeDetailsV1, placeDetailsLegacy, webResults] = await Promise.all([
-      fetchPlaceDetailsV1(placeId, apiKey),
-      fetchPlaceDetailsLegacy(placeId, apiKey),
-      fetchWebInsights(restaurantName, apiKey),
-    ]);
-
-    // Combine all review data
-    const allReviewTexts: string[] = [];
-    const sources: string[] = [];
-
-    if (placeDetailsV1.reviewSummary) {
-      allReviewTexts.push(`[Google Review Summary - based on all ${placeDetailsV1.reviewCount || "many"} reviews] ${placeDetailsV1.reviewSummary}`);
-      sources.push(`Google review summary (${placeDetailsV1.reviewCount || "many"} total reviews)`);
+    const place = await fetchPlaceDetails(placeId, mapsKey);
+    if (!place) {
+      return Response.json({ error: "Restaurant not found" }, { status: 404 });
     }
 
-    if (placeDetailsV1.editorialSummary) {
-      allReviewTexts.push(`[Editorial Summary] ${placeDetailsV1.editorialSummary}`);
-    }
+    const recommendation = await generateRecommendation(anthropicKey, place, feedback);
+    recommendation.photoNames = place.photoNames;
 
-    if (placeDetailsV1.reviews.length > 0) {
-      for (const r of placeDetailsV1.reviews) {
-        allReviewTexts.push(`[Google Review - ${r.rating}★] ${r.text}`);
-      }
-      sources.push(`${placeDetailsV1.reviews.length} Google reviews analyzed`);
-    }
-
-    if (placeDetailsLegacy.reviews.length > 0) {
-      const existingTexts = new Set(allReviewTexts.map(t => t.slice(0, 100)));
-      let addedCount = 0;
-      for (const r of placeDetailsLegacy.reviews) {
-        const formatted = `[Google Review - ${r.rating}★] ${r.text}`;
-        if (!existingTexts.has(formatted.slice(0, 100))) {
-          allReviewTexts.push(formatted);
-          addedCount++;
-        }
-      }
-      if (addedCount > 0 && !sources.some(s => s.includes("Google review"))) {
-        sources.push(`${addedCount} additional Google reviews`);
-      }
-    }
-
-    if (webResults.length > 0) {
-      for (const result of webResults) {
-        allReviewTexts.push(`[Web - ${result.source}] ${result.snippet}`);
-      }
-      const webSources = [...new Set(webResults.map(r => r.source))];
-      sources.push(`Web research (${webSources.join(", ")})`);
-    }
-
-    const reviewContext = allReviewTexts.length > 0
-      ? `Here is research data for ${restaurantName}:\n\n${allReviewTexts.join("\n\n")}`
-      : `No review data available. Use your extensive knowledge of ${restaurantName} to make a recommendation.`;
-
-    if (sources.length === 0) {
-      sources.push("AI recommendation based on restaurant knowledge");
-    }
-
-    // Call Anthropic API to pick the dish
-    const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1024,
-        messages: [
-          {
-            role: "user",
-            content: `You are a food expert and dining critic. Your job is to identify THE ONE dish that someone absolutely must order at a restaurant. It should be the signature item, the thing that makes this place special, the dish people talk about.
-
-Restaurant: ${restaurantName}
-
-${reviewContext}
-
-Based on ALL the data above (review summaries, individual reviews, web research, and your own knowledge), identify the single must-order dish. Consider:
-- What dish is mentioned most frequently and positively across all sources?
-- What seems truly unique or signature to this restaurant?
-- What would a local food expert insist you try?
-- What dish do reviewers specifically call out as a reason to visit?
-
-Respond in this exact JSON format (no markdown, no code blocks, just raw JSON):
-{
-  "dishName": "The exact dish name",
-  "description": "A mouth-watering 1-2 sentence description of the dish that makes someone want to order it immediately",
-  "whyThisOne": "A brief, compelling reason why this is THE dish to order here (1-2 sentences)",
-  "priceRange": "$ or $$ or $$$ or unknown",
-  "tags": ["tag1", "tag2", "tag3"]
-}
-
-Tags should be 2-4 short descriptors like "signature", "spicy", "shareable", "must-try", "local favorite", "chef special", etc.
-
-Important: Be specific. Don't say "their pasta" - say "Cacio e Pepe" or "Rigatoni Bolognese". Make the description vivid and appetizing. Keep all text concise and punchy.`,
-          },
-        ],
-      }),
-    });
-
-    const anthropicData: any = await anthropicResponse.json();
-    const responseText = anthropicData.content?.[0]?.text || "";
-
-    let dishName: string;
-    let description: string;
-    let whyThisOne: string;
-    let priceRange: string;
-    let tags: string[];
-
-    try {
-      const parsed = JSON.parse(responseText);
-      dishName = parsed.dishName || "Chef's Special";
-      description = parsed.description || "A delicious signature dish.";
-      whyThisOne = parsed.whyThisOne || "Highly recommended by locals and critics alike.";
-      priceRange = parsed.priceRange || "$$";
-      tags = parsed.tags || ["must-try"];
-    } catch {
-      dishName = "Chef's Signature Dish";
-      description = "The standout item on the menu, crafted with care and consistently praised.";
-      whyThisOne = "When in doubt, trust the chef's pride and joy.";
-      priceRange = "$$";
-      tags = ["must-try", "signature"];
-    }
-
-    // Now search for actual photos of this specific dish
-    const dishPhotos = await searchDishPhotos(dishName, restaurantName, apiKey);
-
-    const recommendation: DishRecommendation = {
-      dishName,
-      description,
-      whyThisOne,
-      priceRange,
-      tags,
-      sources,
-      dishPhotos,
-    };
-
-    // Cache in KV (TTL: 7 days)
     if (kv) {
-      await kv.put(placeId, JSON.stringify(recommendation), { expirationTtl: 604800 });
+      const ttl = TTL_BY_CONFIDENCE[recommendation.confidence] ?? TTL_BY_CONFIDENCE.low;
+      await kv.put(recKey(placeId), JSON.stringify(recommendation), { expirationTtl: ttl });
     }
 
     return Response.json({ recommendation, cached: false });
   } catch (err) {
     console.error("Recommendation error:", err);
+    if (err instanceof Anthropic.APIError) {
+      return Response.json({ error: "Recommendation engine unavailable, try again shortly" }, { status: 502 });
+    }
     return Response.json({ error: "Failed to generate recommendation" }, { status: 500 });
   }
 };
 
-// ---- Dish photo search ----
+// ---- Feedback ----
 
-async function searchDishPhotos(dishName: string, restaurantName: string, apiKey: string): Promise<string[]> {
-  const photos: string[] = [];
+interface DishFeedback {
+  [dishName: string]: FeedbackCounts;
+}
 
-  // Strategy 1: Google Custom Search JSON API (image search)
-  // Uses the same Google Cloud project as Maps API
-  // Search for "[dish] [restaurant]" to find photos from Yelp, food blogs, etc.
+async function readFeedback(kv: KVNamespace, placeId: string): Promise<DishFeedback | null> {
   try {
-    const query = `${dishName} ${restaurantName} food`;
-    const searchUrl = `https://customsearch.googleapis.com/customsearch/v1?key=${apiKey}&cx=YOUR_CX_HERE&q=${encodeURIComponent(query)}&searchType=image&num=6&imgType=photo&safe=active`;
-
-    // Since Custom Search requires a separate CX (search engine ID),
-    // we'll use an alternative: scrape Google Images thumbnails
-    // via the standard search with tbm=isch parameter
-    const googleImgUrl = `https://www.google.com/search?q=${encodeURIComponent(`${dishName} ${restaurantName}`)}&tbm=isch&ijn=0`;
-
-    const resp = await fetch(googleImgUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html",
-      },
-    });
-
-    if (resp.ok) {
-      const html = await resp.text();
-      // Extract image URLs from Google Images HTML response
-      // Google embeds image data in script tags as base64 or URLs
-      const imgUrls = extractImageUrls(html);
-      photos.push(...imgUrls.slice(0, 6));
-    }
-  } catch (e) {
-    console.error("Google Images search error:", e);
+    return await kv.get<DishFeedback>(feedbackKey(placeId), "json");
+  } catch {
+    return null;
   }
-
-  // Strategy 2: Fallback to Places text search for food photos
-  if (photos.length < 3 && apiKey) {
-    try {
-      const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": apiKey,
-          "X-Goog-FieldMask": "places.photos",
-        },
-        body: JSON.stringify({
-          textQuery: `${dishName} at ${restaurantName}`,
-          maxResultCount: 3,
-        }),
-      });
-
-      const data: any = await resp.json();
-      if (data.places) {
-        for (const place of data.places) {
-          for (const photo of (place.photos || []).slice(0, 3)) {
-            if (photo.name) {
-              // Convert Places v1 photo name to our proxy URL
-              photos.push(`places-v1:${photo.name}`);
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.error("Places text search photo error:", e);
-    }
-  }
-
-  return photos.slice(0, 6);
 }
 
-function extractImageUrls(html: string): string[] {
-  const urls: string[] = [];
-
-  // Method 1: Extract from data attributes and img tags
-  // Google Images embeds thumbnails as data:image or https URLs
-  const imgRegex = /\["(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)",\s*\d+,\s*\d+\]/gi;
-  let match;
-  while ((match = imgRegex.exec(html)) !== null) {
-    const url = match[1];
-    // Skip Google's own assets, icons, and tiny images
-    if (url && !url.includes("gstatic.com") && !url.includes("google.com/images") && !url.includes("googleusercontent.com/fakeurl")) {
-      // Unescape the URL
-      const cleanUrl = url.replace(/\\u003d/g, "=").replace(/\\u0026/g, "&").replace(/\\/g, "");
-      urls.push(cleanUrl);
-    }
-  }
-
-  // Method 2: Extract encrypted_tbn0 thumbnail URLs (these are Google-hosted thumbnails)
-  const tbnRegex = /https:\/\/encrypted-tbn0\.gstatic\.com\/images\?q=tbn:[^"'\s]+/g;
-  let tbnMatch;
-  while ((tbnMatch = tbnRegex.exec(html)) !== null) {
-    const url = tbnMatch[0].replace(/\\u003d/g, "=").replace(/\\u0026/g, "&").replace(/\\/g, "");
-    if (!urls.includes(url)) {
-      urls.push(url);
-    }
-  }
-
-  return urls;
+// A cached pick is discredited when real users have clearly voted it down.
+function isDiscredited(dishName: string, feedback: DishFeedback | null): boolean {
+  if (!feedback) return false;
+  const counts = feedback[dishName.toLowerCase()];
+  if (!counts) return false;
+  return counts.down >= 3 && counts.down > counts.up;
 }
 
-// ---- Review data fetching helpers ----
+// ---- Google Places (New) research input ----
 
-interface V1PlaceData {
+interface PlaceEvidence {
+  name: string;
+  address: string;
+  rating: number | null;
+  reviewCount: number | null;
+  priceLevel: string | null;
   reviewSummary: string | null;
   editorialSummary: string | null;
-  reviewCount: number | null;
   reviews: { rating: number; text: string }[];
-  photoRefs: string[];
+  photoNames: string[];
 }
 
-async function fetchPlaceDetailsV1(placeId: string, apiKey: string): Promise<V1PlaceData> {
-  const empty: V1PlaceData = { reviewSummary: null, editorialSummary: null, reviewCount: null, reviews: [], photoRefs: [] };
-  if (!apiKey) return empty;
+async function fetchPlaceDetails(placeId: string, apiKey: string): Promise<PlaceEvidence | null> {
+  const fieldMask = [
+    "id",
+    "displayName",
+    "formattedAddress",
+    "rating",
+    "userRatingCount",
+    "priceLevel",
+    "reviews",
+    "reviewSummary",
+    "editorialSummary",
+    "photos",
+  ].join(",");
 
-  try {
-    const resp = await fetch(
-      `https://places.googleapis.com/v1/places/${placeId}`,
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key": apiKey,
-          "X-Goog-FieldMask": "reviews,photos,editorialSummary,userRatingCount,reviewSummary",
-        },
-      }
-    );
-    const data: any = await resp.json();
+  const resp = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+    headers: {
+      "X-Goog-Api-Key": apiKey,
+      "X-Goog-FieldMask": fieldMask,
+    },
+  });
 
-    const reviews = (data.reviews || [])
-      .map((r: any) => ({
-        rating: r.rating || 0,
-        text: r.text?.text || r.originalText?.text || "",
-      }))
-      .filter((r: any) => r.text.length > 30);
+  if (resp.status === 404) return null;
+  if (!resp.ok) {
+    throw new Error(`Place Details failed: ${resp.status} ${await resp.text()}`);
+  }
 
-    const photoRefs = (data.photos || [])
-      .slice(0, 10)
+  const data: any = await resp.json();
+  if (!data.displayName?.text) return null;
+
+  const reviews = (data.reviews || [])
+    .map((r: any) => ({
+      rating: r.rating || 0,
+      text: r.text?.text || r.originalText?.text || "",
+    }))
+    .filter((r: { text: string }) => r.text.length > 30);
+
+  return {
+    name: data.displayName.text,
+    address: data.formattedAddress || "",
+    rating: data.rating ?? null,
+    reviewCount: data.userRatingCount ?? null,
+    priceLevel: data.priceLevel ?? null,
+    reviewSummary: data.reviewSummary?.text?.text || null,
+    editorialSummary: data.editorialSummary?.text || null,
+    reviews,
+    photoNames: (data.photos || [])
       .map((p: any) => p.name || "")
-      .filter((n: string) => n.length > 0);
-
-    return {
-      reviewSummary: data.reviewSummary?.text?.text || null,
-      editorialSummary: data.editorialSummary?.text || null,
-      reviewCount: data.userRatingCount || null,
-      reviews,
-      photoRefs,
-    };
-  } catch (e) {
-    console.error("V1 Place Details error:", e);
-    return empty;
-  }
+      .filter((n: string) => n.length > 0)
+      .slice(0, 6),
+  };
 }
 
-interface LegacyPlaceData {
-  reviews: { rating: number; text: string }[];
-  photoRefs: string[];
-}
+// ---- Claude research + recommendation ----
 
-async function fetchPlaceDetailsLegacy(placeId: string, apiKey: string): Promise<LegacyPlaceData> {
-  const empty: LegacyPlaceData = { reviews: [], photoRefs: [] };
-  if (!apiKey) return empty;
+// Shape/type validation only — sizes are clamped in finalizeRecommendation
+// rather than rejected, so an over-eager model answer degrades instead of 500ing.
+const toolInputSchema = z.object({
+  dishName: z.string().min(1),
+  description: z.string().min(1),
+  whyThisOne: z.string().min(1),
+  priceRange: z.enum(["$", "$$", "$$$", "$$$$", "unknown"]),
+  tags: z.array(z.string()),
+  confidence: z.enum(["high", "medium", "low"]),
+  confidenceReason: z.string().min(1),
+  evidence: z.array(z.object({ quote: z.string(), source: z.string() })),
+  citations: z.array(z.object({ title: z.string(), url: z.string() })),
+  runnersUp: z.array(z.object({ dishName: z.string(), note: z.string() })),
+});
 
-  try {
-    const detailsUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=reviews,editorial_summary,photos&key=${apiKey}`;
-    const resp = await fetch(detailsUrl);
-    const data: any = await resp.json();
-
-    const reviews = (data.result?.reviews || [])
-      .map((r: any) => ({
-        rating: r.rating || 0,
-        text: r.text || "",
-      }))
-      .filter((r: any) => r.text.length > 30);
-
-    const photoRefs = (data.result?.photos || [])
-      .slice(0, 10)
-      .map((p: any) => p.photo_reference || "")
-      .filter((ref: string) => ref.length > 0);
-
-    return { reviews, photoRefs };
-  } catch (e) {
-    console.error("Legacy Place Details error:", e);
-    return empty;
-  }
-}
-
-interface WebResult {
-  source: string;
-  snippet: string;
-}
-
-async function fetchWebInsights(restaurantName: string, apiKey: string): Promise<WebResult[]> {
-  if (!apiKey) return [];
-
-  try {
-    const results: WebResult[] = [];
-    const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask": "places.reviews,places.editorialSummary",
+const RECOMMENDATION_TOOL: Anthropic.Beta.BetaTool = {
+  name: "record_recommendation",
+  description:
+    "Record your final, evidence-backed recommendation for the single best dish to order at this restaurant. Call this exactly once, after you have finished researching.",
+  strict: true,
+  input_schema: {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "dishName",
+      "description",
+      "whyThisOne",
+      "priceRange",
+      "tags",
+      "confidence",
+      "confidenceReason",
+      "evidence",
+      "citations",
+      "runnersUp",
+    ],
+    properties: {
+      dishName: {
+        type: "string",
+        description: "The exact name of the single must-order dish, as it appears on the menu or in reviews.",
       },
-      body: JSON.stringify({
-        textQuery: `${restaurantName} best food must try`,
-        maxResultCount: 3,
-      }),
-    });
+      description: {
+        type: "string",
+        description: "A vivid 1-2 sentence description of the dish grounded in what sources actually say about it.",
+      },
+      whyThisOne: {
+        type: "string",
+        description:
+          "1-2 sentences on why this specific dish is THE one, referencing the strength of the evidence (e.g. how many independent sources named it).",
+      },
+      priceRange: {
+        type: "string",
+        enum: ["$", "$$", "$$$", "$$$$", "unknown"],
+        description: "Approximate price tier of the dish/restaurant. Use 'unknown' if you found no pricing signal.",
+      },
+      tags: {
+        type: "array",
+        items: { type: "string" },
+        description: "2-4 short descriptors, e.g. 'signature', 'spicy', 'shareable', 'local favorite'.",
+      },
+      confidence: {
+        type: "string",
+        enum: ["high", "medium", "low"],
+        description:
+          "high = 3+ independent sources converge on this dish; medium = clear signal from one or two source types; low = thin evidence, best-effort pick.",
+      },
+      confidenceReason: {
+        type: "string",
+        description: "One sentence explaining the confidence level, e.g. 'Named in 14 Google reviews, a Reddit thread, and an Eater guide'.",
+      },
+      evidence: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["quote", "source"],
+          properties: {
+            quote: { type: "string", description: "A short VERBATIM quote from a review or article mentioning the dish." },
+            source: { type: "string", description: "Where the quote is from, e.g. 'Google review', 'Reddit', 'Eater'." },
+          },
+        },
+        description: "2-4 of the strongest verbatim quotes supporting this pick. Never invent or paraphrase quotes.",
+      },
+      citations: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["title", "url"],
+          properties: {
+            title: { type: "string" },
+            url: { type: "string", description: "Real URL from your web search results. Never fabricate URLs." },
+          },
+        },
+        description: "Web pages you actually consulted via search that informed this pick. Empty if none.",
+      },
+      runnersUp: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["dishName", "note"],
+          properties: {
+            dishName: { type: "string" },
+            note: { type: "string", description: "One short sentence on why it's a strong contender but not the pick." },
+          },
+        },
+        description: "0-2 dishes that were serious contenders. Helps users trust the process.",
+      },
+    },
+  },
+};
 
-    const data: any = await resp.json();
+const SYSTEM_PROMPT = `You are the research engine behind "Order This One", a service whose entire promise is naming the single best item to order at any restaurant in America — accurately. Users make real dining decisions from your answer, so accuracy beats flair.
 
-    if (data.places) {
-      for (const place of data.places) {
-        if (place.editorialSummary?.text) {
-          results.push({
-            source: "Google",
-            snippet: place.editorialSummary.text,
-          });
-        }
-        if (place.reviews) {
-          for (const review of place.reviews.slice(0, 3)) {
-            const text = review.text?.text || review.originalText?.text || "";
-            if (text.length > 50) {
-              results.push({
-                source: "Google",
-                snippet: `[${review.rating}★] ${text}`,
-              });
-            }
-          }
-        }
-      }
+## Method
+
+1. Read the Google Places data provided (aggregated review summary, editorial summary, individual reviews). Extract every dish mentioned positively and tally roughly how often each comes up.
+2. Research the wider web with the web_search tool. Useful angles: "<restaurant> <city> best thing to order", "<restaurant> reddit what to order", and coverage from local food press (Eater, The Infatuation, local newspapers) or Yelp/TripAdvisor discussion. Search enough to cross-check the leading candidates — typically 2-4 searches. Include the city in queries and confirm results are about THIS restaurant at THIS address, not a same-named place elsewhere.
+3. Converge: the winning dish is the one independent sources agree on. Frequency of specific, enthusiastic mentions beats a single glowing mention. A true signature (a dish the restaurant is known for) beats a generically praised one.
+
+## Evidence rules — non-negotiable
+
+- Only recommend a dish you have actually seen evidenced for this restaurant. Never invent a plausible-sounding dish, and never fall back to "Chef's Special".
+- Quotes in "evidence" must be verbatim from the provided reviews or from pages you found via search. If you can't quote it, don't claim it.
+- Citations must be real URLs from your search results. If you did no useful web research, return an empty citations list.
+- Be honest in "confidence". A low-evidence pick with confidence "low" and a frank confidenceReason is a good answer; inflated confidence is a wrong answer.
+- Be specific: "Cacio e Pepe", not "their pasta".
+
+When your research is complete, call record_recommendation exactly once with your final answer. Keep all text fields concise and punchy.`;
+
+async function generateRecommendation(
+  anthropicKey: string,
+  place: PlaceEvidence,
+  feedback: DishFeedback | null,
+): Promise<DishRecommendation> {
+  const client = new Anthropic({ apiKey: anthropicKey });
+
+  const model = "claude-opus-5";
+  const userPrompt = buildUserPrompt(place, feedback);
+
+  const baseParams = {
+    model,
+    max_tokens: 16000,
+    betas: ["server-side-fallback-2026-06-01"] as string[],
+    fallbacks: [{ model: "claude-opus-4-8" as const }],
+    system: [
+      {
+        type: "text" as const,
+        text: SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" as const },
+      },
+    ],
+    tools: [
+      { type: "web_search_20260209" as const, name: "web_search" as const, max_uses: 6 },
+      RECOMMENDATION_TOOL,
+    ],
+  };
+
+  let messages: Anthropic.Beta.BetaMessageParam[] = [{ role: "user", content: userPrompt }];
+  let nudged = false;
+
+  // Server-side web search runs inside a single request; we only need to loop
+  // for pause_turn continuations and one "call the tool" nudge.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const response = await client.beta.messages.create({ ...baseParams, messages });
+
+    if (response.stop_reason === "refusal") {
+      throw new Error("Model declined the request");
     }
 
-    return results.slice(0, 10);
-  } catch (e) {
-    console.error("Web insights error:", e);
-    return [];
+    if (response.stop_reason === "pause_turn") {
+      messages = [...messages, { role: "assistant", content: response.content }];
+      continue;
+    }
+
+    const toolUse = response.content.find(
+      (block): block is Anthropic.Beta.BetaToolUseBlock =>
+        block.type === "tool_use" && block.name === "record_recommendation",
+    );
+
+    if (toolUse) {
+      return finalizeRecommendation(toolUse.input);
+    }
+
+    // Finished talking without recording an answer — nudge once.
+    if (!nudged) {
+      nudged = true;
+      messages = [
+        ...messages,
+        { role: "assistant", content: response.content },
+        { role: "user", content: "Record your final answer now by calling the record_recommendation tool." },
+      ];
+      continue;
+    }
+
+    break;
   }
+
+  throw new Error("Model did not produce a recommendation");
+}
+
+function buildUserPrompt(place: PlaceEvidence, feedback: DishFeedback | null): string {
+  const lines: string[] = [];
+  lines.push(`Restaurant: ${place.name}`);
+  lines.push(`Address: ${place.address}`);
+  if (place.rating != null && place.reviewCount != null) {
+    lines.push(`Google rating: ${place.rating} (${place.reviewCount} reviews)`);
+  }
+  if (place.priceLevel) lines.push(`Price level: ${place.priceLevel}`);
+  lines.push("");
+
+  if (place.reviewSummary) {
+    lines.push(`Google's AI summary of all reviews:\n${place.reviewSummary}\n`);
+  }
+  if (place.editorialSummary) {
+    lines.push(`Editorial summary: ${place.editorialSummary}\n`);
+  }
+  if (place.reviews.length > 0) {
+    lines.push("Individual Google reviews:");
+    for (const r of place.reviews) {
+      lines.push(`[${r.rating}/5] ${r.text}`);
+    }
+    lines.push("");
+  }
+  if (place.reviews.length === 0 && !place.reviewSummary) {
+    lines.push("No Google review data is available — web research is your only evidence source. If the web has nothing either, pick the best-evidenced option you can find and mark confidence low.");
+    lines.push("");
+  }
+
+  const downvoted = feedback
+    ? Object.entries(feedback)
+        .filter(([, counts]) => counts.down >= 3 && counts.down > counts.up)
+        .map(([dish]) => dish)
+    : [];
+  if (downvoted.length > 0) {
+    lines.push(
+      `User feedback: previous recommendation(s) of ${downvoted.join(", ")} received repeated thumbs-down from diners at this restaurant. Weigh that seriously — either find stronger evidence for a different dish, or only re-recommend one of these if the evidence is overwhelming.`,
+    );
+    lines.push("");
+  }
+
+  lines.push("Find the single best item to order here.");
+  return lines.join("\n");
+}
+
+const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+
+function finalizeRecommendation(rawInput: unknown): DishRecommendation {
+  const parsed = toolInputSchema.safeParse(rawInput);
+  if (!parsed.success) {
+    throw new Error(`Tool output failed validation: ${parsed.error.message}`);
+  }
+  const input = parsed.data;
+
+  const citations = input.citations
+    .filter((c) => {
+      try {
+        return new URL(c.url).protocol === "https:";
+      } catch {
+        return false;
+      }
+    })
+    .slice(0, 8)
+    .map((c) => ({ title: clip(c.title.trim() || c.url, 200), url: c.url }));
+
+  return {
+    version: REC_VERSION,
+    dishName: clip(input.dishName, 200),
+    description: clip(input.description, 600),
+    whyThisOne: clip(input.whyThisOne, 600),
+    priceRange: input.priceRange,
+    tags: input.tags.filter((t) => t.trim().length > 0).slice(0, 6).map((t) => clip(t, 40)),
+    confidence: input.confidence,
+    confidenceReason: clip(input.confidenceReason, 400),
+    evidence: input.evidence
+      .filter((ev) => ev.quote.trim().length > 0)
+      .slice(0, 6)
+      .map((ev) => ({ quote: clip(ev.quote, 500), source: clip(ev.source || "review", 120) })),
+    citations,
+    runnersUp: input.runnersUp
+      .filter((ru) => ru.dishName.trim().length > 0)
+      .slice(0, 3)
+      .map((ru) => ({ dishName: clip(ru.dishName, 200), note: clip(ru.note, 300) })),
+    photoNames: [],
+    generatedAt: new Date().toISOString(),
+  };
 }

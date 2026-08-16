@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
+import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -19,9 +20,16 @@ import {
   Search,
   Sparkles,
   Camera,
+  Quote,
+  Link as LinkIcon,
+  ThumbsUp,
+  ThumbsDown,
+  ShieldCheck,
+  ShieldQuestion,
+  ShieldAlert,
   X,
 } from "lucide-react";
-import type { RestaurantResult, DishRecommendation } from "@shared/schema";
+import type { RestaurantResult, DishRecommendation, Confidence } from "@shared/schema";
 
 interface AutocompletePrediction {
   placeId: string;
@@ -31,23 +39,40 @@ interface AutocompletePrediction {
 
 type AppState = "locating" | "browse" | "loading-rec" | "result";
 
-function PhotoGallery({ dishPhotos, dishName }: { dishPhotos: string[]; dishName: string }) {
+const CONFIDENCE_META: Record<Confidence, { label: string; icon: typeof ShieldCheck; className: string }> = {
+  high: {
+    label: "Strong evidence",
+    icon: ShieldCheck,
+    className: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30",
+  },
+  medium: {
+    label: "Good evidence",
+    icon: ShieldQuestion,
+    className: "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30",
+  },
+  low: {
+    label: "Limited evidence",
+    icon: ShieldAlert,
+    className: "bg-muted text-muted-foreground border-border",
+  },
+};
+
+const LOADING_STEPS = [
+  "Reading Google reviews...",
+  "Searching the web for local favorites...",
+  "Checking Reddit and food press...",
+  "Cross-referencing the top contenders...",
+  "Settling on the one dish...",
+];
+
+const photoUrl = (name: string) => `/api/restaurants/photo?name=${encodeURIComponent(name)}`;
+
+function PhotoGallery({ photoNames, alt }: { photoNames: string[]; alt: string }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const [failedImages, setFailedImages] = useState<Set<number>>(new Set());
-  const validPhotos = dishPhotos.filter((_, i) => !failedImages.has(i));
-  const validIndices = dishPhotos.map((_, i) => i).filter(i => !failedImages.has(i));
+  const validIndices = photoNames.map((_, i) => i).filter((i) => !failedImages.has(i));
 
-  if (validPhotos.length === 0) return null;
-
-  const getPhotoUrl = (ref: string) => {
-    if (ref.startsWith("places-v1:")) {
-      return `/api/restaurants/photo?name=${encodeURIComponent(ref.slice(10))}`;
-    }
-    if (ref.startsWith("https://")) {
-      return `/api/restaurants/photo?url=${encodeURIComponent(ref)}`;
-    }
-    return `/api/restaurants/photo?ref=${encodeURIComponent(ref)}`;
-  };
+  if (validIndices.length === 0) return null;
 
   const currentValidPosition = validIndices.indexOf(activeIndex);
   const safePosition = currentValidPosition >= 0 ? currentValidPosition : 0;
@@ -57,12 +82,12 @@ function PhotoGallery({ dishPhotos, dishName }: { dishPhotos: string[]; dishName
     <div className="mt-4" data-testid="photo-gallery">
       <div className="relative rounded-xl overflow-hidden bg-muted aspect-[4/3]">
         <img
-          src={getPhotoUrl(dishPhotos[safeActiveIndex])}
-          alt={`${dishName} at restaurant`}
+          src={photoUrl(photoNames[safeActiveIndex])}
+          alt={alt}
           className="w-full h-full object-cover"
-          onError={() => setFailedImages(prev => new Set(prev).add(safeActiveIndex))}
+          onError={() => setFailedImages((prev) => new Set(prev).add(safeActiveIndex))}
         />
-        {validPhotos.length > 1 && (
+        {validIndices.length > 1 && (
           <>
             <button
               onClick={() => {
@@ -88,10 +113,10 @@ function PhotoGallery({ dishPhotos, dishName }: { dishPhotos: string[]; dishName
         )}
         <div className="absolute bottom-2 right-2 bg-black/50 text-white text-xs px-2 py-1 rounded-full flex items-center gap-1">
           <Camera className="w-3 h-3" />
-          {safePosition + 1}/{validPhotos.length}
+          {safePosition + 1}/{validIndices.length}
         </div>
       </div>
-      {validPhotos.length > 1 && (
+      {validIndices.length > 1 && (
         <div className="flex gap-1.5 mt-2 overflow-x-auto pb-1 scrollbar-hide">
           {validIndices.map((origIndex, i) => (
             <button
@@ -105,11 +130,11 @@ function PhotoGallery({ dishPhotos, dishName }: { dishPhotos: string[]; dishName
               data-testid={`photo-thumb-${i}`}
             >
               <img
-                src={getPhotoUrl(dishPhotos[origIndex])}
+                src={photoUrl(photoNames[origIndex])}
                 alt={`Photo ${i + 1}`}
                 className="w-full h-full object-cover"
                 loading="lazy"
-                onError={() => setFailedImages(prev => new Set(prev).add(origIndex))}
+                onError={() => setFailedImages((prev) => new Set(prev).add(origIndex))}
               />
             </button>
           ))}
@@ -119,7 +144,235 @@ function PhotoGallery({ dishPhotos, dishName }: { dishPhotos: string[]; dishName
   );
 }
 
+function LoadingResearch({ restaurantName }: { restaurantName: string }) {
+  const [step, setStep] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setStep((s) => Math.min(s + 1, LOADING_STEPS.length - 1));
+    }, 9000);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center px-6 bg-background">
+      <div className="flex flex-col items-center gap-6 text-center max-w-sm">
+        <div className="relative">
+          <div className="w-20 h-20 rounded-full bg-primary/10 flex items-center justify-center">
+            <Flame className="w-10 h-10 text-primary" />
+          </div>
+          <div className="absolute -top-1 -right-1 w-6 h-6 rounded-full bg-primary flex items-center justify-center">
+            <Loader2 className="w-3.5 h-3.5 text-primary-foreground animate-spin" />
+          </div>
+        </div>
+        <div>
+          <h1 className="text-xl font-bold text-foreground">Researching {restaurantName}</h1>
+          <p className="text-sm text-muted-foreground mt-2" data-testid="loading-step">
+            {LOADING_STEPS[step]}
+          </p>
+          <p className="text-xs text-muted-foreground/70 mt-3">
+            First lookup for a restaurant runs a deep review-and-web research pass — it can take a minute. It's instant after that.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResultView({
+  restaurant,
+  recommendation,
+  onBack,
+}: {
+  restaurant: RestaurantResult;
+  recommendation: DishRecommendation;
+  onBack: () => void;
+}) {
+  const { toast } = useToast();
+  const [voted, setVoted] = useState<"up" | "down" | null>(null);
+
+  const feedbackMutation = useMutation({
+    mutationFn: async (vote: "up" | "down") => {
+      const res = await apiRequest("POST", "/api/restaurants/feedback", {
+        placeId: restaurant.placeId,
+        dishName: recommendation.dishName,
+        vote,
+      });
+      return (await res.json()) as { ok: boolean };
+    },
+    onSuccess: (_data, vote) => {
+      setVoted(vote);
+      toast({
+        title: vote === "up" ? "Glad it hit the spot!" : "Thanks for the heads up",
+        description:
+          vote === "up"
+            ? "Your vote helps keep this pick on top."
+            : "Enough reports like yours and we'll re-research this restaurant.",
+      });
+    },
+    onError: () => {
+      toast({ title: "Couldn't record that", description: "Please try again.", variant: "destructive" });
+    },
+  });
+
+  const confidence = CONFIDENCE_META[recommendation.confidence] ?? CONFIDENCE_META.low;
+  const ConfidenceIcon = confidence.icon;
+
+  return (
+    <div className="min-h-screen bg-background">
+      <div className="max-w-lg mx-auto px-4 py-6">
+        <button
+          onClick={onBack}
+          className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-6"
+          data-testid="back-button"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Back to restaurants
+        </button>
+        <div className="flex items-center gap-2 mb-2">
+          <MapPin className="w-4 h-4 text-primary" />
+          <span className="text-sm font-medium text-muted-foreground">{restaurant.name}</span>
+        </div>
+        <div className="mt-4">
+          <p className="text-xs font-semibold uppercase tracking-widest text-primary mb-2">Order This One</p>
+          <h1 className="text-2xl font-bold text-foreground leading-tight" data-testid="dish-name">
+            {recommendation.dishName}
+          </h1>
+
+          <div className="flex flex-wrap items-center gap-2 mt-3">
+            <Badge variant="outline" className={`text-xs font-medium gap-1 ${confidence.className}`} data-testid="confidence-badge">
+              <ConfidenceIcon className="w-3 h-3" />
+              {confidence.label}
+            </Badge>
+            {recommendation.priceRange && recommendation.priceRange !== "unknown" && (
+              <Badge variant="outline" className="text-xs font-medium">
+                {recommendation.priceRange}
+              </Badge>
+            )}
+            {recommendation.tags.map((tag) => (
+              <Badge key={tag} variant="secondary" className="text-xs font-medium">
+                {tag}
+              </Badge>
+            ))}
+          </div>
+
+          {recommendation.photoNames && recommendation.photoNames.length > 0 && (
+            <PhotoGallery photoNames={recommendation.photoNames} alt={`${restaurant.name} photos`} />
+          )}
+
+          <p className="text-base text-foreground/80 mt-4 leading-relaxed">{recommendation.description}</p>
+
+          <Card className="mt-5 p-4 border-primary/20 bg-primary/5">
+            <div className="flex items-start gap-3">
+              <Sparkles className="w-5 h-5 text-primary mt-0.5 shrink-0" />
+              <div>
+                <p className="text-sm font-semibold text-foreground">Why this dish?</p>
+                <p className="text-sm text-foreground/70 mt-1 leading-relaxed">{recommendation.whyThisOne}</p>
+                {recommendation.confidenceReason && (
+                  <p className="text-xs text-muted-foreground mt-2">{recommendation.confidenceReason}</p>
+                )}
+              </div>
+            </div>
+          </Card>
+
+          {recommendation.evidence.length > 0 && (
+            <div className="mt-6" data-testid="evidence-section">
+              <p className="text-sm font-semibold text-foreground mb-2">What people say</p>
+              <div className="space-y-2">
+                {recommendation.evidence.map((ev, i) => (
+                  <div key={i} className="flex items-start gap-2.5 p-3 rounded-lg bg-muted/50">
+                    <Quote className="w-3.5 h-3.5 text-muted-foreground mt-0.5 shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm text-foreground/80 leading-relaxed">“{ev.quote}”</p>
+                      <p className="text-xs text-muted-foreground mt-1">— {ev.source}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {recommendation.runnersUp.length > 0 && (
+            <div className="mt-6" data-testid="runners-up-section">
+              <p className="text-sm font-semibold text-foreground mb-2">Also in the running</p>
+              <div className="space-y-1.5">
+                {recommendation.runnersUp.map((ru, i) => (
+                  <div key={i} className="flex items-start gap-2 text-sm">
+                    <Utensils className="w-3.5 h-3.5 text-muted-foreground mt-1 shrink-0" />
+                    <p className="text-foreground/70">
+                      <span className="font-medium text-foreground">{ru.dishName}</span>
+                      {" — "}
+                      {ru.note}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {recommendation.citations.length > 0 && (
+            <div className="mt-6" data-testid="citations-section">
+              <p className="text-sm font-semibold text-foreground mb-2">Sources</p>
+              <div className="space-y-1">
+                {recommendation.citations.map((c, i) => (
+                  <a
+                    key={i}
+                    href={c.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 text-sm text-primary hover:underline truncate"
+                  >
+                    <LinkIcon className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">{c.title}</span>
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <Card className="mt-6 p-4">
+            <p className="text-sm font-semibold text-foreground">Been here? Was this the right call?</p>
+            <div className="flex gap-2 mt-3">
+              <Button
+                variant={voted === "up" ? "default" : "outline"}
+                size="sm"
+                className="flex-1"
+                disabled={voted !== null || feedbackMutation.isPending}
+                onClick={() => feedbackMutation.mutate("up")}
+                data-testid="feedback-up"
+              >
+                <ThumbsUp className="w-4 h-4 mr-1.5" />
+                Nailed it
+              </Button>
+              <Button
+                variant={voted === "down" ? "default" : "outline"}
+                size="sm"
+                className="flex-1"
+                disabled={voted !== null || feedbackMutation.isPending}
+                onClick={() => feedbackMutation.mutate("down")}
+                data-testid="feedback-down"
+              >
+                <ThumbsDown className="w-4 h-4 mr-1.5" />
+                Wrong pick
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground mt-2">
+              Votes feed back into the research — repeated "wrong pick" reports trigger a fresh deep-dive.
+            </p>
+          </Card>
+
+          <Button className="w-full mt-6" size="lg" onClick={onBack} data-testid="try-another">
+            <Utensils className="w-4 h-4 mr-2" />
+            Try Another Restaurant
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
+  const { toast } = useToast();
   const [appState, setAppState] = useState<AppState>("locating");
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [selectedRestaurant, setSelectedRestaurant] = useState<RestaurantResult | null>(null);
@@ -159,7 +412,7 @@ export default function Home() {
           url += `&lat=${coords.lat}&lng=${coords.lng}`;
         }
         const res = await apiRequest("GET", url);
-        const data = await res.json();
+        const data = (await res.json()) as { predictions?: AutocompletePrediction[] };
         setPredictions(data.predictions || []);
         setShowPredictions(true);
       } catch {
@@ -197,7 +450,7 @@ export default function Home() {
     setIsGeocoding(true);
     try {
       const res = await apiRequest("GET", `/api/geocode?address=${encodeURIComponent(manualLocation.trim())}`);
-      const data = await res.json();
+      const data = (await res.json()) as { lat: number; lng: number; formatted: string };
       setCoords({ lat: data.lat, lng: data.lng });
       setLocationLabel(data.formatted);
       setLocationError(null);
@@ -216,7 +469,7 @@ export default function Home() {
         "GET",
         `/api/restaurants/nearby?lat=${coords!.lat}&lng=${coords!.lng}&radius=1500`
       );
-      return res.json();
+      return (await res.json()) as { restaurants: RestaurantResult[] };
     },
     enabled: !!coords,
   });
@@ -227,15 +480,19 @@ export default function Home() {
     mutationFn: async (restaurant: RestaurantResult) => {
       const res = await apiRequest("POST", "/api/restaurants/recommend", {
         placeId: restaurant.placeId,
-        restaurantName: restaurant.name,
       });
-      return res.json();
+      return (await res.json()) as { recommendation: DishRecommendation; cached: boolean };
     },
     onSuccess: (data) => {
       setRecommendation(data.recommendation);
       setAppState("result");
     },
     onError: () => {
+      toast({
+        title: "Research failed",
+        description: "Couldn't finish researching that restaurant. Give it another try.",
+        variant: "destructive",
+      });
       setAppState("browse");
     },
   });
@@ -256,18 +513,22 @@ export default function Home() {
       setIsSearchingRestaurant(true);
       try {
         const res = await apiRequest("GET", `/api/restaurants/details?placeId=${encodeURIComponent(prediction.placeId)}`);
-        const data = await res.json();
+        const data = (await res.json()) as { restaurant: RestaurantResult };
         const restaurant: RestaurantResult = data.restaurant;
         setSelectedRestaurant(restaurant);
         setAppState("loading-rec");
         recommendMutation.mutate(restaurant);
       } catch {
-        // Failed to fetch details
+        toast({
+          title: "Couldn't load that restaurant",
+          description: "Please try searching again.",
+          variant: "destructive",
+        });
       } finally {
         setIsSearchingRestaurant(false);
       }
     },
-    [recommendMutation]
+    [recommendMutation, toast]
   );
 
   const handleBack = useCallback(() => {
@@ -337,97 +598,11 @@ export default function Home() {
   }
 
   if (appState === "result" && recommendation && selectedRestaurant) {
-    return (
-      <div className="min-h-screen bg-background">
-        <div className="max-w-lg mx-auto px-4 py-6">
-          <button
-            onClick={handleBack}
-            className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-6"
-            data-testid="back-button"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            Back to restaurants
-          </button>
-          <div className="flex items-center gap-2 mb-2">
-            <MapPin className="w-4 h-4 text-primary" />
-            <span className="text-sm font-medium text-muted-foreground">
-              {selectedRestaurant.name}
-            </span>
-          </div>
-          <div className="mt-4">
-            <p className="text-xs font-semibold uppercase tracking-widest text-primary mb-2">
-              Order This One
-            </p>
-            <h1 className="text-2xl font-bold text-foreground leading-tight">
-              {recommendation.dishName}
-            </h1>
-            {recommendation.dishPhotos && recommendation.dishPhotos.length > 0 && (
-              <PhotoGallery dishPhotos={recommendation.dishPhotos} dishName={recommendation.dishName} />
-            )}
-            <p className="text-base text-foreground/80 mt-4 leading-relaxed">
-              {recommendation.description}
-            </p>
-            <div className="flex flex-wrap gap-2 mt-4">
-              {recommendation.tags.map((tag) => (
-                <Badge key={tag} variant="secondary" className="text-xs font-medium">
-                  {tag}
-                </Badge>
-              ))}
-              {recommendation.priceRange && recommendation.priceRange !== "unknown" && (
-                <Badge variant="outline" className="text-xs font-medium">
-                  {recommendation.priceRange}
-                </Badge>
-              )}
-            </div>
-            <Card className="mt-6 p-4 border-primary/20 bg-primary/5">
-              <div className="flex items-start gap-3">
-                <Sparkles className="w-5 h-5 text-primary mt-0.5 shrink-0" />
-                <div>
-                  <p className="text-sm font-semibold text-foreground">Why this dish?</p>
-                  <p className="text-sm text-foreground/70 mt-1 leading-relaxed">
-                    {recommendation.whyThisOne}
-                  </p>
-                </div>
-              </div>
-            </Card>
-            {recommendation.sources.length > 0 && (
-              <p className="text-xs text-muted-foreground mt-4">
-                Based on {recommendation.sources.join(", ").toLowerCase()}
-              </p>
-            )}
-            <Button className="w-full mt-6" size="lg" onClick={handleBack} data-testid="try-another">
-              <Utensils className="w-4 h-4 mr-2" />
-              Try Another Restaurant
-            </Button>
-          </div>
-        </div>
-      </div>
-    );
+    return <ResultView restaurant={selectedRestaurant} recommendation={recommendation} onBack={handleBack} />;
   }
 
   if (appState === "loading-rec" && selectedRestaurant) {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center px-6 bg-background">
-        <div className="flex flex-col items-center gap-6 text-center max-w-sm">
-          <div className="relative">
-            <div className="w-20 h-20 rounded-full bg-primary/10 flex items-center justify-center">
-              <Flame className="w-10 h-10 text-primary" />
-            </div>
-            <div className="absolute -top-1 -right-1 w-6 h-6 rounded-full bg-primary flex items-center justify-center">
-              <Loader2 className="w-3.5 h-3.5 text-primary-foreground animate-spin" />
-            </div>
-          </div>
-          <div>
-            <h1 className="text-xl font-bold text-foreground">
-              Researching {selectedRestaurant.name}
-            </h1>
-            <p className="text-sm text-muted-foreground mt-2">
-              Analyzing reviews to find the one dish you need to order...
-            </p>
-          </div>
-        </div>
-      </div>
-    );
+    return <LoadingResearch restaurantName={selectedRestaurant.name} />;
   }
 
   return (
@@ -439,7 +614,7 @@ export default function Home() {
             <h1 className="text-lg font-bold text-foreground">Order This One</h1>
           </div>
           <p className="text-sm text-muted-foreground mt-1">
-            Tap a restaurant to discover the one must-order dish.
+            Tap a restaurant to discover the one must-order dish — researched from reviews, Reddit, and food press.
           </p>
           {locationLabel && (
             <button
@@ -534,9 +709,9 @@ export default function Home() {
                 className="w-full text-left p-3.5 rounded-xl border border-border bg-card hover:bg-accent/50 transition-colors flex items-center gap-3 group"
                 data-testid={`restaurant-${restaurant.placeId}`}
               >
-                {restaurant.photoRef ? (
+                {restaurant.photoName ? (
                   <img
-                    src={`/api/restaurants/photo?ref=${restaurant.photoRef}`}
+                    src={photoUrl(restaurant.photoName)}
                     alt={restaurant.name}
                     className="w-14 h-14 rounded-lg object-cover shrink-0"
                     loading="lazy"
