@@ -8,6 +8,7 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
     const input = (url.searchParams.get("input") || "").trim();
     const lat = parseFloat(url.searchParams.get("lat") || "");
     const lng = parseFloat(url.searchParams.get("lng") || "");
+    const session = url.searchParams.get("session");
 
     if (!input) {
       return Response.json({ predictions: [] });
@@ -22,6 +23,12 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
       input,
       includedPrimaryTypes: ["restaurant"],
     };
+
+    // Session token groups keystroke requests + the eventual details call into
+    // one billed autocomplete session.
+    if (session && /^[A-Za-z0-9-]{1,64}$/.test(session)) {
+      body.sessionToken = session;
+    }
 
     // Bias results toward the user's location if available.
     if (!isNaN(lat) && !isNaN(lng)) {

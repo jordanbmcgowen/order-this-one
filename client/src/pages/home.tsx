@@ -189,7 +189,17 @@ function ResultView({
   onBack: () => void;
 }) {
   const { toast } = useToast();
-  const [voted, setVoted] = useState<"up" | "down" | null>(null);
+  // Votes are remembered per place+dish so one diner can't re-vote their way
+  // to the regeneration threshold from a single device.
+  const voteKey = `oto-vote:${restaurant.placeId}:${recommendation.dishName.toLowerCase()}`;
+  const [voted, setVoted] = useState<"up" | "down" | null>(() => {
+    try {
+      const v = localStorage.getItem(voteKey);
+      return v === "up" || v === "down" ? v : null;
+    } catch {
+      return null;
+    }
+  });
 
   const feedbackMutation = useMutation({
     mutationFn: async (vote: "up" | "down") => {
@@ -202,6 +212,11 @@ function ResultView({
     },
     onSuccess: (_data, vote) => {
       setVoted(vote);
+      try {
+        localStorage.setItem(voteKey, vote);
+      } catch {
+        // Private browsing — vote still counted server-side.
+      }
       toast({
         title: vote === "up" ? "Glad it hit the spot!" : "Thanks for the heads up",
         description:
@@ -387,6 +402,10 @@ export default function Home() {
   const [isSearchingRestaurant, setIsSearchingRestaurant] = useState(false);
   const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchContainerRef = useRef<HTMLDivElement>(null);
+  // Invalidates in-flight autocomplete responses when the input changes/clears.
+  const searchSeqRef = useRef(0);
+  // Google Places autocomplete billing session; closed by the details call.
+  const sessionTokenRef = useRef<string | null>(null);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -399,6 +418,8 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    searchSeqRef.current += 1;
+    const seq = searchSeqRef.current;
     if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
     if (!restaurantSearch.trim()) {
       setPredictions([]);
@@ -407,16 +428,23 @@ export default function Home() {
     }
     searchDebounceRef.current = setTimeout(async () => {
       try {
-        let url = `/api/restaurants/autocomplete?input=${encodeURIComponent(restaurantSearch.trim())}`;
+        if (!sessionTokenRef.current) {
+          sessionTokenRef.current =
+            typeof crypto !== "undefined" && "randomUUID" in crypto
+              ? crypto.randomUUID()
+              : Math.random().toString(36).slice(2);
+        }
+        let url = `/api/restaurants/autocomplete?input=${encodeURIComponent(restaurantSearch.trim())}&session=${sessionTokenRef.current}`;
         if (coords) {
           url += `&lat=${coords.lat}&lng=${coords.lng}`;
         }
         const res = await apiRequest("GET", url);
         const data = (await res.json()) as { predictions?: AutocompletePrediction[] };
+        if (seq !== searchSeqRef.current) return; // stale response — input changed
         setPredictions(data.predictions || []);
         setShowPredictions(true);
       } catch {
-        setPredictions([]);
+        if (seq === searchSeqRef.current) setPredictions([]);
       }
     }, 300);
     return () => {
@@ -462,7 +490,12 @@ export default function Home() {
     }
   }, [manualLocation]);
 
-  const { data: restaurantsData, isLoading: isLoadingRestaurants } = useQuery<{ restaurants: RestaurantResult[] }>({
+  const {
+    data: restaurantsData,
+    isLoading: isLoadingRestaurants,
+    isError: isRestaurantsError,
+    refetch: refetchRestaurants,
+  } = useQuery<{ restaurants: RestaurantResult[] }>({
     queryKey: ["/api/restaurants/nearby", coords?.lat, coords?.lng],
     queryFn: async () => {
       const res = await apiRequest(
@@ -483,7 +516,10 @@ export default function Home() {
       });
       return (await res.json()) as { recommendation: DishRecommendation; cached: boolean };
     },
-    onSuccess: (data) => {
+    onSuccess: (data, restaurant) => {
+      // Pair the result with the restaurant this mutation was started for, so
+      // an overlapping selection can never mismatch header and recommendation.
+      setSelectedRestaurant(restaurant);
       setRecommendation(data.recommendation);
       setAppState("result");
     },
@@ -497,22 +533,30 @@ export default function Home() {
     },
   });
 
+  const selectionBusy = recommendMutation.isPending || isSearchingRestaurant;
+
   const handleSelectRestaurant = useCallback(
     (restaurant: RestaurantResult) => {
+      if (selectionBusy) return;
       setSelectedRestaurant(restaurant);
       setAppState("loading-rec");
       recommendMutation.mutate(restaurant);
     },
-    [recommendMutation]
+    [recommendMutation, selectionBusy]
   );
 
   const handleSelectPrediction = useCallback(
     async (prediction: AutocompletePrediction) => {
+      if (selectionBusy) return;
       setShowPredictions(false);
       setRestaurantSearch("");
       setIsSearchingRestaurant(true);
       try {
-        const res = await apiRequest("GET", `/api/restaurants/details?placeId=${encodeURIComponent(prediction.placeId)}`);
+        const session = sessionTokenRef.current;
+        let url = `/api/restaurants/details?placeId=${encodeURIComponent(prediction.placeId)}`;
+        if (session) url += `&session=${session}`;
+        sessionTokenRef.current = null; // the details call closes the billing session
+        const res = await apiRequest("GET", url);
         const data = (await res.json()) as { restaurant: RestaurantResult };
         const restaurant: RestaurantResult = data.restaurant;
         setSelectedRestaurant(restaurant);
@@ -528,7 +572,7 @@ export default function Home() {
         setIsSearchingRestaurant(false);
       }
     },
-    [recommendMutation, toast]
+    [recommendMutation, toast, selectionBusy]
   );
 
   const handleBack = useCallback(() => {
@@ -692,6 +736,16 @@ export default function Home() {
             {[...Array(6)].map((_, i) => (
               <Skeleton key={i} className="h-20 w-full rounded-xl" />
             ))}
+          </div>
+        ) : isRestaurantsError ? (
+          <div className="text-center py-12" data-testid="nearby-error">
+            <Utensils className="w-10 h-10 text-muted-foreground/40 mx-auto mb-3" />
+            <p className="text-sm text-muted-foreground mb-4">
+              Couldn't load nearby restaurants right now.
+            </p>
+            <Button variant="outline" size="sm" onClick={() => refetchRestaurants()}>
+              Try again
+            </Button>
           </div>
         ) : restaurants.length === 0 ? (
           <div className="text-center py-12">

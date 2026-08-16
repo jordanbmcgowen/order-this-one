@@ -15,8 +15,10 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
       return Response.json({ error: "Server not configured" }, { status: 503 });
     }
 
-    // Places photo names look like: places/{placeId}/photos/{photoId}
-    if (!photoName || !/^places\/[^/]+\/photos\/[^/]+$/.test(photoName)) {
+    // Places photo names look like: places/{placeId}/photos/{photoId}, where
+    // both IDs are URL-safe tokens. The strict character class keeps URL
+    // metacharacters (?, #, &, \) out of the upstream request we build.
+    if (!photoName || !/^places\/[A-Za-z0-9_-]+\/photos\/[A-Za-z0-9_-]+$/.test(photoName)) {
       return Response.json({ error: "Invalid photo reference" }, { status: 400 });
     }
 

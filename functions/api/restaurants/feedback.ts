@@ -1,15 +1,10 @@
 import { feedbackRequestSchema } from "../../../shared/schema";
-import type { FeedbackCounts } from "../../../shared/schema";
+import type { DishRecommendation } from "../../../shared/schema";
+import { recKey, feedbackKey, type DishFeedback } from "./recommend";
 
 interface Env {
   RECOMMENDATIONS: KVNamespace;
 }
-
-interface DishFeedback {
-  [dishName: string]: FeedbackCounts;
-}
-
-const feedbackKey = (placeId: string) => `fb:v1:${placeId}`;
 
 export const onRequestPost: PagesFunction<Env> = async (context) => {
   let body: unknown;
@@ -33,6 +28,21 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
   const dish = dishName.toLowerCase();
 
   try {
+    // Votes are only accepted for the dish this place's live recommendation
+    // actually names. This anchors feedback KV usage to real recommendations
+    // (no unbounded keys or attacker-chosen dish strings, which would
+    // otherwise flow into a future research prompt).
+    const cached = await kv.get<DishRecommendation>(recKey(placeId), "json");
+    if (!cached) {
+      return Response.json({ error: "No recommendation to rate" }, { status: 404 });
+    }
+    if (cached.dishName.toLowerCase() !== dish) {
+      return Response.json({ error: "Feedback must be for the current recommendation" }, { status: 400 });
+    }
+
+    // Note: KV has no atomic increment, so near-simultaneous votes can clobber
+    // each other. Feedback is an advisory regeneration signal, not an exact
+    // tally, so last-write-wins is an accepted tradeoff here.
     const key = feedbackKey(placeId);
     const existing = (await kv.get<DishFeedback>(key, "json")) || {};
     const counts = existing[dish] || { up: 0, down: 0 };

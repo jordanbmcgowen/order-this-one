@@ -9,9 +9,13 @@ interface Env {
   RECOMMENDATIONS: KVNamespace;
 }
 
-const REC_VERSION = 2;
-const recKey = (placeId: string) => `rec:v${REC_VERSION}:${placeId}`;
-const feedbackKey = (placeId: string) => `fb:v1:${placeId}`;
+export const REC_VERSION = 2;
+export const recKey = (placeId: string) => `rec:v${REC_VERSION}:${placeId}`;
+export const feedbackKey = (placeId: string) => `fb:v1:${placeId}`;
+
+// Feedback-triggered regeneration is expensive (full research pass), so cap it
+// to once per cooldown window per place regardless of vote volume.
+const REGEN_COOLDOWN_MS = 6 * 3600 * 1000;
 
 // Confidence-weighted cache lifetimes: strong evidence keeps longer, weak
 // evidence gets retried sooner so the database self-corrects.
@@ -46,7 +50,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     // Serve from cache unless user feedback says the cached pick is wrong.
     if (kv) {
       const cached = await kv.get<DishRecommendation>(recKey(placeId), "json");
-      if (cached && !isDiscredited(cached.dishName, feedback)) {
+      if (cached && !shouldRegenerate(cached, feedback)) {
         return Response.json({ recommendation: cached, cached: true });
       }
     }
@@ -58,6 +62,8 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
 
     const recommendation = await generateRecommendation(anthropicKey, place, feedback);
     recommendation.photoNames = place.photoNames;
+    recommendation.feedbackDownAtGeneration =
+      feedback?.[recommendation.dishName.toLowerCase()]?.down ?? 0;
 
     if (kv) {
       const ttl = TTL_BY_CONFIDENCE[recommendation.confidence] ?? TTL_BY_CONFIDENCE.low;
@@ -76,7 +82,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
 
 // ---- Feedback ----
 
-interface DishFeedback {
+export interface DishFeedback {
   [dishName: string]: FeedbackCounts;
 }
 
@@ -88,12 +94,18 @@ async function readFeedback(kv: KVNamespace, placeId: string): Promise<DishFeedb
   }
 }
 
-// A cached pick is discredited when real users have clearly voted it down.
-function isDiscredited(dishName: string, feedback: DishFeedback | null): boolean {
+// A cached pick is regenerated when real users have clearly voted it down —
+// but only when downvotes have grown past the count the pick was generated
+// against (a re-confirmed dish isn't re-researched on the same old votes),
+// and never more often than the cooldown allows.
+function shouldRegenerate(rec: DishRecommendation, feedback: DishFeedback | null): boolean {
   if (!feedback) return false;
-  const counts = feedback[dishName.toLowerCase()];
+  const counts = feedback[rec.dishName.toLowerCase()];
   if (!counts) return false;
-  return counts.down >= 3 && counts.down > counts.up;
+  const baseline = rec.feedbackDownAtGeneration ?? 0;
+  if (!(counts.down >= 3 && counts.down > counts.up && counts.down > baseline)) return false;
+  const age = Date.now() - Date.parse(rec.generatedAt);
+  return !Number.isFinite(age) || age > REGEN_COOLDOWN_MS;
 }
 
 // ---- Google Places (New) research input ----
@@ -131,7 +143,9 @@ async function fetchPlaceDetails(placeId: string, apiKey: string): Promise<Place
     },
   });
 
-  if (resp.status === 404) return null;
+  // 404 = well-formed but unknown ID; 400 = malformed ID. Both are "no such
+  // restaurant" from the client's perspective, not a server failure.
+  if (resp.status === 404 || resp.status === 400) return null;
   if (!resp.ok) {
     throw new Error(`Place Details failed: ${resp.status} ${await resp.text()}`);
   }
@@ -332,6 +346,12 @@ async function generateRecommendation(
 
     if (response.stop_reason === "refusal") {
       throw new Error("Model declined the request");
+    }
+
+    // Output budget exhausted — any trailing tool_use input may be truncated
+    // and must not be trusted (structured-output guarantees don't hold here).
+    if (response.stop_reason === "max_tokens") {
+      throw new Error("Research exceeded the output budget");
     }
 
     if (response.stop_reason === "pause_turn") {

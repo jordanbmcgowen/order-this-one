@@ -8,12 +8,15 @@ export const nearbySearchSchema = z.object({
   radius: z.number().min(100).max(50000).optional().default(1500),
 });
 
+// Google place IDs are URL-safe tokens (e.g. "ChIJN1t_tDeuEmsRUsoyG83frY4").
+export const placeIdSchema = z.string().regex(/^[A-Za-z0-9_-]{4,512}$/);
+
 export const recommendationRequestSchema = z.object({
-  placeId: z.string().min(1).max(512),
+  placeId: placeIdSchema,
 });
 
 export const feedbackRequestSchema = z.object({
-  placeId: z.string().min(1).max(512),
+  placeId: placeIdSchema,
   dishName: z.string().min(1).max(200),
   vote: z.enum(["up", "down"]),
 });
@@ -69,6 +72,10 @@ export interface DishRecommendation {
   runnersUp: RunnerUp[];
   photoNames: string[]; // Places API (New) photo resource names for the restaurant
   generatedAt: string; // ISO timestamp
+  // Downvote count for this dish at generation time. Regeneration only triggers
+  // when downvotes have GROWN past this baseline, so a re-confirmed pick isn't
+  // stuck in a regenerate-forever loop.
+  feedbackDownAtGeneration?: number;
 }
 
 export interface FeedbackCounts {

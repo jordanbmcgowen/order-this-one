@@ -8,9 +8,10 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
   try {
     const url = new URL(context.request.url);
     const placeId = url.searchParams.get("placeId");
+    const session = url.searchParams.get("session");
 
-    if (!placeId) {
-      return Response.json({ error: "Missing placeId" }, { status: 400 });
+    if (!placeId || !/^[A-Za-z0-9_-]{4,512}$/.test(placeId)) {
+      return Response.json({ error: "Invalid placeId" }, { status: 400 });
     }
 
     const apiKey = context.env.GOOGLE_MAPS_API_KEY;
@@ -18,14 +19,22 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
       return Response.json({ error: "Server not configured" }, { status: 503 });
     }
 
-    const resp = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+    // Closing the autocomplete session here groups the keystroke requests and
+    // this details call into one billed session on Google's side.
+    let detailsUrl = `https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`;
+    if (session && /^[A-Za-z0-9-]{1,64}$/.test(session)) {
+      detailsUrl += `?sessionToken=${encodeURIComponent(session)}`;
+    }
+
+    const resp = await fetch(detailsUrl, {
       headers: {
         "X-Goog-Api-Key": apiKey,
         "X-Goog-FieldMask": PLACE_FIELDS.join(","),
       },
     });
 
-    if (resp.status === 404) {
+    // 404 = unknown ID; 400 = malformed ID — both are "not found" to clients.
+    if (resp.status === 404 || resp.status === 400) {
       return Response.json({ error: "Restaurant not found" }, { status: 404 });
     }
     if (!resp.ok) {
